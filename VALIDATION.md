@@ -1,3 +1,25 @@
+# Step 99 Clip Fraction 超限修复与实际验证（2026-10-12）
+
+本节为最新结果。Step 98 已提交，Step 99 因平均 Ratio=0.998073、Clip Fraction=0.020960 超过原 1% 门限而停止。
+
+核验当前 checkpoint/待处理批次 State 指纹一致。使用原 State 和 seed 重放现有 batched Rollout：全部 32 条 Completion Token 序列一致，2958 个 Old LogProb 最大误差为 0.0，表明这次偏差来自 BF16 Decode/Teacher Forcing 数值路径，不能仅凭固定 Clip Fraction 门限判定策略过期。
+
+修复保留原门限作为重放验证触发条件。超限轮次用当前 State、原 seed、原 Rank Group 分配及原采样 Batch 顺序重放；Token/Mask 必须一致，采样 Old LogProb 最大误差须 ≤1e-5。验证失败仍拒绝 Optimizer Step，非有限数值和 State/Step/Policy Version 错配仍拒绝。验证通过保留原 Old LogProb 和 PPO Loss 执行正常更新。没有重算替换采样 LogProb，没有修改 CUDA Kernel 或 BF16 计算方程。正常轮次无额外重放成本。
+
+已备份 latest.before-step99-fix.pt / pending.before-step99-fix.json，实际执行：
+
+```bash
+uv run python -m grpo.train --config configs/online.full.json --resume --stop-after-steps 100
+```
+
+Step 99 触发行为重放（最大采样 LogProb 误差 0），成功更新一次；Step 100 的 Ratio=1.000325 / Clip Fraction=0.001282 未触发重放。最终 Global Step=Policy Version=100、cursor=400、AdamW step=100，原 Step 98 未重复更新。逐条比较 Step 99 与备份待处理记录，Completion/Old LogProb/Mask/Judge 全部不变，并使用原 Step 98 State 指纹。pending 已清理。
+
+同一 SwanLab Run `85aa8850f5ab4147aa30e92d8de39a03` 上传完成（48 records），保留 17 个核心标量，没有重新启用 performance、trace 或逐组图表。重放诊断只留本地 metrics JSON 和终端。
+
+`uv run pytest -q`：**59 passed，1 skipped**。新增覆盖超限必须经过行为验证、重放拒绝 Token/Mask/Old LogProb 篡改、按完整 Group 保持原 Rank 分配。NCCL 双 GPU 仍因硬件不足跳过。
+
+---
+
 # Judge Schema 修复、性能优化与恢复验证（2026-10-12）
 
 本节为最新结果。
