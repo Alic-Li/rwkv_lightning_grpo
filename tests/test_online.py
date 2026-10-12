@@ -13,12 +13,14 @@ from grpo.io import read_json
 class TinyPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.initial_state = nn.Parameter(torch.tensor([.1, -.2, .3]))
+        state = torch.zeros(1, 1, 64, 64)
+        state.flatten()[:3] = torch.tensor([.1, -.2, .3])
+        self.initial_state = nn.Parameter(state)
         self.backbone = nn.Linear(3, 3, bias=False)
         self.backbone.requires_grad_(False)
 
     def forward(self, ids, targets, chunk_size=128, completion_mask=None):
-        logits = self.initial_state * (ids.float()[..., None] + 1)
+        logits = self.initial_state.flatten()[:3] * (ids.float()[..., None] + 1)
         return logits.log_softmax(-1).gather(-1, targets[..., None]).squeeze(-1)
 
 
@@ -102,6 +104,9 @@ def test_three_steps_fresh_policy_complete_trace(tmp_path, monkeypatch):
     assert torch.equal(weights, policy.backbone.weight) and policy.backbone.weight.grad is None
     assert policy.initial_state.dtype == torch.float32
     for step, metric in logger.logs:
+        exported = torch.load(tmp_path / f'state-{step:08d}.pth', weights_only=True)
+        full = torch.load(tmp_path / f'state-{step:08d}.pt', weights_only=True)
+        assert torch.equal(exported['blocks.0.att.time_state'], full['initial_state'][0].bfloat16())
         trace = [json.loads(line) for line in (tmp_path / f'steps/{step:08d}.jsonl').read_text().splitlines()]
         assert set(metric) <= train.SWANLAB_METRICS
         assert not any(k.startswith(('performance/', 'trace/', 'reward/group/')) for k in metric)
@@ -124,7 +129,7 @@ def test_microbatch_global_normalization(tmp_path, monkeypatch):
         torch.testing.assert_close(ca['optimizer']['state'][0][key], cb['optimizer']['state'][0][key])
 
 
-@pytest.mark.parametrize('phase', ['rollout', 'judge', 'training', 'commit', 'logging'])
+@pytest.mark.parametrize('phase', ['rollout', 'judge', 'training', 'commit', 'export', 'logging'])
 def test_interrupt_resume_exactly_once(tmp_path, monkeypatch, phase):
     monkeypatch.setattr(train, 'rollout_batch', fake_rollout)
     reference = TinyPolicy()
@@ -144,8 +149,16 @@ def test_interrupt_resume_exactly_once(tmp_path, monkeypatch, phase):
     original_save = train.atomic_torch
     if phase == 'commit':
         def fail(path, obj):
-            if obj['global_step'] > 0:
+            if obj.get('global_step', 0) > 0:
                 raise RuntimeError('injected before commit')
+            return original_save(path, obj)
+        monkeypatch.setattr(train, 'atomic_torch', fail)
+    if phase == 'export':
+        def fail(path, obj):
+            if path.name == 'latest-state.pth':
+                committed = torch.load(Path(c['output']) / 'latest.pt', weights_only=True)
+                if committed['global_step'] > 0:
+                    raise RuntimeError('injected after durable commit before export')
             return original_save(path, obj)
         monkeypatch.setattr(train, 'atomic_torch', fail)
     if phase == 'logging':
@@ -161,6 +174,10 @@ def test_interrupt_resume_exactly_once(tmp_path, monkeypatch, phase):
     torch.testing.assert_close(resumed['initial_state'], expected['initial_state'])
     for key in ['exp_avg', 'exp_avg_sq', 'step']:
         torch.testing.assert_close(resumed['optimizer']['state'][0][key], expected['optimizer']['state'][0][key])
+    exported = torch.load(Path(c['output']) / 'latest-state.pth', weights_only=True)
+    assert set(exported) == {'blocks.0.att.time_state'}
+    assert exported['blocks.0.att.time_state'].dtype == torch.bfloat16
+    assert torch.equal(exported['blocks.0.att.time_state'], resumed['initial_state'][0].bfloat16())
     assert len(set(logger.runs)) == 1
     assert [step for step, _ in logger.logs] == [1, 2, 3]
     assert not (Path(c['output']) / 'pending.json').exists()

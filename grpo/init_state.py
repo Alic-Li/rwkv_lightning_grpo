@@ -1,8 +1,43 @@
-"""Create explicit State_v0 or import upstream time_state tensors tensors."""
+"""Convert and export standalone RWKV SFT time_state checkpoints."""
 
 import argparse
 import torch
 from .io import atomic_torch, file_hash, state_hash
+
+
+def import_time_state(raw, shape, layout):
+    """Convert explicit source axes to native FP32 [layer,head,value,key]."""
+    if layout not in ('value-key', 'key-value'):
+        raise ValueError('Raw SFT state requires state_layout=value-key or key-value; square tensor shapes cannot determine axes')
+    layers, heads, values, keys = shape
+    expected = {f'blocks.{i}.att.time_state' for i in range(layers)}
+    if not isinstance(raw, dict) or set(raw) != expected:
+        actual = set(raw) if isinstance(raw, dict) else set()
+        raise ValueError(f'Invalid SFT state layers: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}')
+    tensors = []
+    for i in range(layers):
+        tensor = raw[f'blocks.{i}.att.time_state']
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point() or tuple(tensor.shape) != (heads, values, keys):
+            raise ValueError(f'Imported state does not match backbone at layer {i}')
+        tensors.append(tensor.detach().float())
+    state = torch.stack(tensors)
+    if layout == 'key-value':
+        state = state.transpose(-1, -2).contiguous()
+    if not torch.isfinite(state).all():
+        raise ValueError('Nonfinite imported state')
+    return state
+
+
+def export_time_state(state):
+    """Same keys, BF16 dtype and value-key layout as rwkv_lightning_cuda export."""
+    if state.ndim != 4 or state.shape[-2:] != (64, 64) or min(state.shape) < 1:
+        raise ValueError('Expected state shape [layer,head,64,64]')
+    if not torch.isfinite(state).all():
+        raise ValueError('Nonfinite state export')
+    bf16 = state.detach().to(device='cpu', dtype=torch.bfloat16).contiguous()
+    if not torch.isfinite(bf16).all():
+        raise ValueError('BF16 state export overflow')
+    return {f'blocks.{i}.att.time_state': bf16[i].contiguous() for i in range(len(bf16))}
 
 
 def main():
@@ -18,11 +53,7 @@ def main():
     s = torch.zeros(L, H, N, N, dtype=torch.float32)
     if args.import_state:
         raw = torch.load(args.import_state, map_location="cpu", weights_only=True)
-        s = torch.stack([raw[f"blocks.{i}.att.time_state"].float() for i in range(L)])
-        if args.layout == "key-value":
-            s = s.transpose(-1, -2).contiguous()
-        if s.shape != (L, H, N, N):
-            raise ValueError("Imported state does not match backbone")
+        s = import_time_state(raw, (L, H, N, N), args.layout)
     if not torch.isfinite(s).all():
         raise ValueError("Nonfinite state")
     from pathlib import Path

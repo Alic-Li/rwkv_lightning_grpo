@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 from .data import prompts
 from .io import atomic_json, atomic_torch, config_cli, digest, file_hash, load_policy, lock, read_json, state_hash
 from .judge import Judge
+from .init_state import export_time_state
 from .online import distributed, group_advantages, rank_call, root_call, sample_metrics, score_samples, train_step
 from .rollout import rollout_batch
 from .tokenizer import TRIE_TOKENIZER
@@ -140,6 +141,12 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
     training = TrainingPolicy(policy, c.get('activation_checkpointing', True))
     model = DDP(training, device_ids=[device.index] if device.type == 'cuda' else None, broadcast_buffers=False) if world > 1 else training
 
+    def publish_state(state, step, archive=False):
+        raw = export_time_state(state)
+        atomic_torch(root / 'latest-state.pth', raw)
+        if archive:
+            atomic_torch(root / f'state-{step:08d}.pth', raw)
+
     def commit(metrics=None):
         states = rank_call(rng_state)
         state = policy.initial_state.detach().cpu()
@@ -147,11 +154,16 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
                   backbone_sha256=snapshot['backbone_sha256'], base_snapshot=snapshot, optimizer=optimizer.state_dict(),
                   rng=states, scheduler=None, layout='layer,head,value,key', metrics=metrics)
         root_call(lambda: atomic_torch(checkpoint, ck), rank)
+        root_call(lambda: publish_state(state, ck['global_step'], ck['global_step'] > 0 and ck['global_step'] % c['checkpoint_interval'] == 0), rank)
         if ck['global_step'] and ck['global_step'] % c['checkpoint_interval'] == 0:
             root_call(lambda: atomic_torch(root / f"state-{ck['global_step']:08d}.pt", ck), rank)
 
     if not checkpoint.exists():
         commit()
+    else:
+        # A crash after the durable commit but before export must not leave the
+        # inference state stale. Regenerate exports from the committed FP32 state.
+        root_call(lambda: publish_state(ck['initial_state'], ck['global_step'], ck['global_step'] > 0 and ck['global_step'] % c['checkpoint_interval'] == 0), rank)
     def init_logger():
         if logger is None:
             return

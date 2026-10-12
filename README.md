@@ -17,10 +17,25 @@ uv run python -m grpo.judge --config configs/online.full.json
 
 修改配置中的模型、词表、数据路径、Judge 地址和输出目录。`state` 为空时从 FP32 零 State 开始，也可导入兼容的 State-only checkpoint。旧 Stage 1/2/3 CLI 和跨 Stage manifest 训练入口已移除；历史数据读取辅助函数仍保留用于检查旧产物。旧离线训练 checkpoint 不包含在线 sampler/RNG 元数据，不能作为在线恢复点；可用兼容的完成 State checkpoint 初始化新运行。
 
+## SFT State 初始化与导出
+
+`rwkv_lightning_cuda` 导出的 `v13b-s688.pth` 可直接初始化，使用 `configs/online.full_state_init.json`：
+
+```bash
+uv run python -m grpo.train --config configs/online.full_state_init.json
+# 中断后继续
+uv run python -m grpo.train --config configs/online.full_state_init.json --resume
+```
+
+配置 `state` 指向原始 `.pth`，`state_layout` 设置为 `value-key`。该文件保存 `blocks.N.att.time_state`，每层为 BF16 `[head,value,key]`；本仓库使用相同轴顺序，无需转置。加载时转为 FP32 可训练参数，校验层数、形状及有限值。其他来源的 raw State 必须显式指定 `value-key` 或 `key-value`，不根据方形张量猜测轴顺序。已有带 layout/指纹的内部 checkpoint 不需要这个字段。
+
+每次提交后输出 `latest-state.pth`，键名、BF16 类型和轴顺序与 `v13b-s688.pth` 一致，不含额外元数据或 Backbone；历史导出为 `state-XXXXXXXX.pth`。FP32 参数导出到 BF16 会发生正常量化，训练和恢复继续保留 FP32 精度。`.pth` 用于推理或初始化新运行，完整中断恢复使用 `latest.pt`。
+
 ## 配置
 
 | 参数 | 含义 |
 |---|---|
+| `state` / `state_layout` | 初始化文件 / raw SFT State 的轴顺序 |
 | `prompts_per_step` | 每轮全局 Prompt 数 P，尾批允许少于 P |
 | `group_size` | 每个 Prompt 的 Completion 数 G，至少 2 |
 | `microbatch` | 每个 Rank 单次真正的 batched teacher forcing 大小 |
@@ -57,7 +72,9 @@ DDP 按完整 Prompt Group 分配各 Rank Rollout；Rank 0 汇总并评分，再
 
 ```text
 runs/online_7b/
-  latest.pt                     # 每轮原子提交；不含 Backbone
+  latest.pt                    # 完整恢复，FP32 State + Optimizer；不含 Backbone
+  latest-state.pth             # 每轮导出，BF16 blocks.N.att.time_state
+  state-00000010.pth           # checkpoint_interval 历史推理 State
   state-00000010.pt             # checkpoint_interval 历史快照
   pending.json                  # 当前尚未提交轮次的 Rollout、成功评分、策略契约
   steps/00000001.jsonl          # 本轮所有完整样本
@@ -68,7 +85,7 @@ runs/online_7b/
 
 latest.pt 保存 FP32 State、Optimizer、Scheduler=None（当前固定 LR）、Global Step、Epoch、Sampler cursor、每个 Rank 的 Python/Torch/CUDA RNG、Policy Version、State 指纹和配置/数据/词表/模型契约。恢复需要相同配置和 world_size，设置 resume=true；不会重复消费已提交批次。
 
-更新先写逐样本和指标文件，随后原子替换 latest.pt，最后上传日志并清理 pending。若在 Rollout 中断，整轮重新生成，稳定采样 seed 不变；若评分中断，复用成功评分。若在 backward / optimizer / checkpoint 提交前失败，从上一份 State、Optimizer、RNG 恢复并重新执行这一未提交更新。若提交后日志或清理失败，恢复只补日志，不重做更新。未提交的 steps 文件可能已存在，应以 latest.pt.global_step 判断提交状态。
+更新先写逐样本和指标文件，随后原子替换 latest.pt，再导出 latest-state.pth，最后上传日志并清理 pending。若在 Rollout 中断，整轮重新生成，稳定采样 seed 不变；若评分中断，复用成功评分。若在 backward / optimizer / checkpoint 提交前失败，从上一份 State、Optimizer、RNG 恢复并重新执行这一未提交更新。若提交后日志或清理失败，恢复只补日志，不重做更新。若提交后导出失败，恢复从 latest.pt 重新生成导出，不重复 Optimizer Step。未提交的 steps 文件可能已存在，应以 latest.pt.global_step 判断提交状态。
 
 仅 Rank 0 使用 SwanLab，每个 Global Step 只上传 17 个核心标量：Loss、LR、Grad/State Norm、Ratio、Clip Fraction、Approx KL、有效 Token、跳过更新标记；Reward Mean/Std、零方差组比例；平均 Completion Length、Judge 成功率；Epoch、Policy Version、State 更新幅度。Global Step 作为曲线横轴。
 

@@ -88,16 +88,26 @@ def load_policy(config, device):
             print("Initial WKV State: FP32 zeros (no checkpoint)", flush=True)
     else:
         ckpt = torch.load(state_path, map_location="cpu", weights_only=True)
-        if ckpt.get("layout") != "layer,head,value,key":
-            raise ValueError("Unsupported state layout; import through grpo.init_state")
-        if not ckpt.get("complete", True):
-            raise ValueError(
-                "Use a completed state checkpoint for a new policy snapshot"
+        if not isinstance(ckpt, dict):
+            raise ValueError('State checkpoint must be a tensor dictionary')
+        if ckpt.get('layout') == 'layer,head,value,key':
+            if not ckpt.get('complete', True):
+                raise ValueError('Use a completed state checkpoint for a new policy snapshot')
+            initial_state = ckpt['initial_state']
+            version = state_hash(initial_state)
+            if ckpt['backbone_sha256'] != model_hash or ckpt['state_version'] != version:
+                raise ValueError('State checkpoint fingerprint mismatch')
+        elif any(str(k).endswith('.att.time_state') for k in ckpt):
+            from .init_state import import_time_state
+            initial_state = import_time_state(
+                ckpt, (backbone.n_layer, backbone.n_head, backbone.head_size, backbone.head_size),
+                config.get('state_layout'),
             )
-        initial_state = ckpt["initial_state"]
-        version = state_hash(initial_state)
-        if ckpt["backbone_sha256"] != model_hash or ckpt["state_version"] != version:
-            raise ValueError("State checkpoint fingerprint mismatch")
+            version = state_hash(initial_state)
+        else:
+            raise ValueError('Unsupported state layout; import through grpo.init_state')
+        if int(os.environ.get('RANK', '0')) == 0 and not config.get('resume'):
+            print(f'Initial WKV State: loaded {state_path}, FP32 norm={float(initial_state.float().norm()):.6f}', flush=True)
     policy = StatePolicy(backbone, initial_state)
     snapshot = {
         "backbone_sha256": model_hash,

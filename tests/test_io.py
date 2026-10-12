@@ -54,3 +54,54 @@ def test_default_state_matches_explicit_zero_checkpoint(model_path, tmp_path, se
 def test_missing_explicit_state_does_not_silently_reset(model_path, tmp_path):
     with pytest.raises(FileNotFoundError):
         load_policy({"model": model_path, "state": str(tmp_path / "missing.pt")}, "cpu")
+
+
+@pytest.mark.parametrize('layout', ['value-key', 'key-value'])
+def test_raw_sft_initialization_and_export_axes(model_path, tmp_path, layout):
+    from grpo.init_state import export_time_state
+    state = torch.arange(2 * 64 * 64).reshape(2, 1, 64, 64).bfloat16()
+    raw = {f'blocks.{i}.att.time_state': state[i] if layout == 'value-key' else state[i].transpose(-1, -2) for i in range(2)}
+    path = tmp_path / 'sft.pth'
+    torch.save(raw, path)
+    policy, snapshot = load_policy({'model': model_path, 'state': str(path), 'state_layout': layout}, 'cpu')
+    assert torch.equal(policy.initial_state, state.float())
+    assert snapshot['state_version'] == state_hash(state)
+    assert policy.initial_state.dtype == torch.float32 and policy.initial_state.requires_grad
+    exported = export_time_state(policy.initial_state)
+    assert set(exported) == set(raw)
+    for i, tensor in enumerate(exported.values()):
+        assert tensor.dtype == torch.bfloat16 and tensor.is_contiguous()
+        assert torch.equal(tensor, state[i])
+    # The export itself is directly reusable as the next run's SFT initialization.
+    torch.save(exported, path)
+    reloaded, expected = load_policy({'model': model_path, 'state': str(path), 'state_layout': 'value-key'}, 'cpu')
+    assert snapshot == expected
+    assert torch.equal(reloaded.initial_state, policy.initial_state)
+
+
+@pytest.mark.parametrize('failure', ['layout', 'missing', 'extra', 'shape', 'nonfinite'])
+def test_raw_sft_rejects_invalid_input(model_path, tmp_path, failure):
+    raw = {f'blocks.{i}.att.time_state': torch.zeros(1, 64, 64) for i in range(2)}
+    layout = 'value-key'
+    if failure == 'layout':
+        layout = None
+    elif failure == 'missing':
+        del raw['blocks.1.att.time_state']
+    elif failure == 'extra':
+        raw['blocks.2.att.time_state'] = torch.zeros(1, 64, 64)
+    elif failure == 'shape':
+        raw['blocks.1.att.time_state'] = torch.zeros(64, 64)
+    else:
+        raw['blocks.1.att.time_state'][0, 0, 0] = float('nan')
+    path = tmp_path / 'invalid.pth'
+    torch.save(raw, path)
+    with pytest.raises(ValueError):
+        load_policy({'model': model_path, 'state': str(path), 'state_layout': layout}, 'cpu')
+
+
+def test_export_rejects_nonfinite_and_bf16_overflow():
+    from grpo.init_state import export_time_state
+    for value in (float('inf'), torch.finfo(torch.float32).max):
+        state = torch.full((1, 1, 64, 64), value)
+        with pytest.raises(ValueError):
+            export_time_state(state)
