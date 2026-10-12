@@ -1,5 +1,6 @@
 """Single-entry, recoverable Online State-only GRPO (native PyTorch DDP)."""
 import json
+import math
 import os
 import random
 import uuid
@@ -20,6 +21,31 @@ from .online import distributed, group_advantages, rank_call, root_call, sample_
 from .rollout import rollout_batch
 from .tokenizer import TRIE_TOKENIZER
 from .training import TrainingPolicy
+
+
+def verify_behavior_rollout(policy, samples, tokenizer, c, rank=0, world=1):
+    """Replay the original rank-local sampling batch without modifying its data.
+
+    Only used when BF16 teacher-forcing population diagnostics exceed limits.
+    Seeds, prefill sharing, batch order and continuous decode must be identical
+    to collection; a teacher-forcing recomputation cannot validate sampling logp.
+    """
+    local = [s for i, s in enumerate(samples) if (i // c['group_size']) % world == rank]
+    generated = rollout_batch(policy, [s['prompt_ids'] for s in local], tokenizer,
+                              c['sampling'], [s['seed'] for s in local])
+    if len(generated) != len(local):
+        raise RuntimeError('Rollout alignment verification failed: incomplete replay')
+    maximum = 0.
+    for original, replay in zip(local, generated):
+        if original['completion_ids'] != replay['completion_ids'] or original['mask'] != replay['mask']:
+            raise RuntimeError('Rollout alignment verification failed: Token/Mask mismatch')
+        old, new = original['old_logprobs'], replay['old_logprobs']
+        if len(old) != len(new) or any(not math.isfinite(x) for x in old + new):
+            raise RuntimeError('Rollout alignment verification failed: invalid logprob')
+        maximum = max(maximum, max((abs(a - b) for a, b in zip(old, new)), default=0.))
+    if maximum > 1e-5:
+        raise RuntimeError(f'Rollout alignment verification failed: sampling logprob error={maximum:.6f}')
+    return maximum
 
 
 def rng_state():
@@ -204,11 +230,15 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             judge_seconds = monotonic() - judge_started
             zero = group_advantages(samples, c['group_size'], c.get('advantage_eps', 1e-6))
             train_started = monotonic()
-            metrics = train_step(policy, model, optimizer, samples, c, rank, world)
-            if rank == 0 and metrics['alignment/max_error_exceeded']:
+            metrics = train_step(
+                policy, model, optimizer, samples, c, rank, world,
+                verify_rollout=lambda: verify_behavior_rollout(policy, samples, tokenizer, c, rank, world),
+            )
+            if rank == 0 and (metrics['alignment/max_error_exceeded'] or metrics['alignment/behavior_replayed']):
                 tqdm.write(f"Step {step}: BF16 alignment tail max={metrics['alignment/max_abs_logprob_error']:.6f} "
                            f"(diagnostic), ratio={metrics['training/ratio_mean']:.6f}, "
-                           f"clip_fraction={metrics['training/clip_fraction']:.4%}")
+                           f"clip_fraction={metrics['training/clip_fraction']:.4%}, "
+                           f"behavior_replayed={metrics['alignment/behavior_replayed']}")
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             train_seconds = monotonic() - train_started

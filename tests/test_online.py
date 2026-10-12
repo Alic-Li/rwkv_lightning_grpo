@@ -213,9 +213,12 @@ def test_swanlab_core_metrics_do_not_upload_detail_or_read_trace(tmp_path):
 
 
 def test_alignment_failure_never_commits_or_updates(tmp_path, monkeypatch):
+    calls = []
     def corrupt(*args):
         samples = fake_rollout(*args)
-        samples[0]['old_logprobs'][0] += 1
+        if not calls:
+            samples[0]['old_logprobs'][0] += 1
+        calls.append(1)
         return samples
     monkeypatch.setattr(train, 'rollout_batch', corrupt)
     steps = []
@@ -314,3 +317,40 @@ def test_length_bucketing_reduces_padding_with_same_update():
     assert metrics[1]['training/padding_fraction'] < metrics[0]['training/padding_fraction']
     assert metrics[0]['training/valid_tokens'] == metrics[1]['training/valid_tokens'] == 48
     torch.testing.assert_close(a.initial_state, b.initial_state)
+
+
+def test_population_outlier_requires_successful_behavior_replay():
+    from grpo.online import train_step
+    policy = TinyPolicy()
+    optimizer = torch.optim.AdamW([policy.initial_state], lr=.001)
+    samples = alignment_batch(policy, 1000, 21, .25)
+    calls = []
+    metrics = train_step(policy, policy, optimizer, samples, dict(microbatch=128, group_size=2),
+                         verify_rollout=lambda: calls.append(1) or 0.)
+    assert calls == [1] and metrics['alignment/behavior_replayed'] == 1
+    assert metrics['training/clip_fraction'] == pytest.approx(.021)
+    assert optimizer.state[policy.initial_state]['step'] == 1
+
+
+@pytest.mark.parametrize('field', ['completion_ids', 'mask', 'old_logprobs'])
+def test_behavior_replay_rejects_corrupted_sample(monkeypatch, field):
+    monkeypatch.setattr(train, 'rollout_batch', fake_rollout)
+    policy = TinyPolicy()
+    generated = fake_rollout(policy, [[0], [0]], None, {}, [1, 2])
+    samples = [dict(s, prompt_ids=[0], seed=i + 1) for i, s in enumerate(generated)]
+    samples[0][field] = list(samples[0][field])
+    samples[0][field][0] += 1
+    with pytest.raises(RuntimeError, match='alignment verification failed'):
+        train.verify_behavior_rollout(policy, samples, None, dict(group_size=2, sampling={}))
+
+
+def test_behavior_replay_keeps_rank_group_assignment(monkeypatch):
+    jobs = []
+    def replay(policy, prompt_ids, tokenizer, sampling, seeds):
+        jobs.append((prompt_ids, seeds))
+        return [dict(completion_ids=[1], mask=[1], old_logprobs=[-1.]) for _ in seeds]
+    monkeypatch.setattr(train, 'rollout_batch', replay)
+    samples = [dict(prompt_ids=[i // 2], seed=i, completion_ids=[1], mask=[1], old_logprobs=[-1.]) for i in range(6)]
+    for rank in range(2):
+        assert train.verify_behavior_rollout(None, samples, None, dict(group_size=2, sampling={}), rank, 2) == 0
+    assert jobs == [([[0], [0], [2], [2]], [0, 1, 4, 5]), ([[1], [1]], [2, 3])]

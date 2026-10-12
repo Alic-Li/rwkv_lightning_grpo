@@ -125,7 +125,7 @@ def group_advantages(samples, group_size, eps):
     return zero / (len(samples) / group_size)
 
 
-def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
+def train_step(policy, model, optimizer, samples, c, rank=0, world=1, verify_rollout=None):
     """One global token denominator and at most one optimizer step, regardless of P/G/B."""
     device = policy.initial_state.device
     micro, group = c['microbatch'], c['group_size']
@@ -173,14 +173,17 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
         dist.all_reduce(max_error, op=dist.ReduceOp.MAX)
     if not torch.isfinite(stats).all():
         raise RuntimeError('Nonfinite loss statistics')
-    # Decode (T=1, shrinking batches) and teacher forcing (T=chunk_size) use
-    # different BF16 GEMM/recurrent rounding paths. A max over thousands of
-    # tokens is an outlier diagnostic, not evidence of a stale policy. Keep
-    # the population ratio/clip guards below, plus the caller's strict state,
-    # step and policy-version checks. Never replace the recorded sampling logp.
+    # Teacher forcing and shrinking T=1 decode have distinct BF16 rounding.
+    # Population limits trigger validation of the actual behavior policy,
+    # rather than guessing policy freshness from a fixed numeric threshold.
     max_error_exceeded = float(max_error) > c.get('alignment_tolerance', .3)
-    if abs(float(stats[1] / tokens) - 1) > c.get('alignment_mean_ratio_tolerance', .02) or float(stats[2] / tokens) > c.get('alignment_max_clip_fraction', .01):
-        raise RuntimeError(f'Old/new ratio alignment exceeds BF16 tolerance: ratio={float(stats[1] / tokens):.6f}, clip_fraction={float(stats[2] / tokens):.6f}')
+    population_error = (abs(float(stats[1] / tokens) - 1) > c.get('alignment_mean_ratio_tolerance', .02)
+                        or float(stats[2] / tokens) > c.get('alignment_max_clip_fraction', .01))
+    replay_max_error = 0.
+    if population_error:
+        if verify_rollout is None:
+            raise RuntimeError(f'Old/new ratio alignment exceeds BF16 tolerance: ratio={float(stats[1] / tokens):.6f}, clip_fraction={float(stats[2] / tokens):.6f}; behavior replay required')
+        replay_max_error = max(rank_call(verify_rollout))
     norm = 0.
     if not skip:
         def check_gradient():
@@ -204,6 +207,8 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
         'training/teacher_forcing_tokens': int(stats[6]),
         'training/padding_fraction': float(1 - stats[7] / stats[6]),
         'training/skipped_update': int(skip), 'policy/state_update_norm': float((policy.initial_state.detach() - before).norm()),
+        'alignment/behavior_replayed': int(population_error),
+        'alignment/replay_max_abs_logprob_error': replay_max_error,
         'alignment/max_abs_logprob_error': float(max_error),
         'alignment/max_error_exceeded': int(max_error_exceeded),
         'alignment/mean_abs_logprob_error': float(stats[4] / tokens),
