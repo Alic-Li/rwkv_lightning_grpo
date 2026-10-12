@@ -36,6 +36,15 @@ def root_call(fn, rank):
     return rank_call(lambda: fn() if rank == 0 else None)[0]
 
 
+def failed_judge_attempts(sample):
+    if 'judge_failed_attempts' in sample:
+        return sample['judge_failed_attempts']
+    # Legacy checkpoints recorded one exception string for several HTTP attempts.
+    prefix = 'Judge failed after bounded retries: '
+    return sum(len(error[len(prefix):].split(' | ')) if error.startswith(prefix) else 1
+               for error in sample.get('judge_failures', []))
+
+
 def score_samples(samples, judge, concurrency, save, *, rank=0, max_rounds=3,
                   retry_delay=2., on_retry=None):
     """Retry only missing scores; root persists successes, peers receive heartbeats.
@@ -74,8 +83,9 @@ def score_samples(samples, judge, concurrency, save, *, rank=0, max_rounds=3,
                         s['judge'], s['judge_seconds'] = result, latency
                         s['reward'] = result['reward']
                     except Exception as exc:
+                        prior_attempts = failed_judge_attempts(s)
                         s.setdefault('judge_failures', []).append(str(exc))
-                        s['judge_failed_attempts'] = s.get('judge_failed_attempts', 0) + len(getattr(exc, 'errors', [str(exc)]))
+                        s['judge_failed_attempts'] = prior_attempts + len(getattr(exc, 'errors', [str(exc)]))
                         s.setdefault('judge_failed_request_seconds', []).extend(getattr(exc, 'request_seconds', []))
                         errors.append(str(exc))
                         if isinstance(exc, JudgeRequestError):
@@ -214,7 +224,7 @@ def sample_metrics(samples):
     distribution('judge/request_latency', [latency for s in samples for latency in s['judge'].get('request_seconds', [s['judge_seconds']]) + s.get('judge_failed_request_seconds', [])])
     for dim in DIMS:
         distribution('judge/' + dim, [s['judge']['scores'][dim] for s in samples])
-    failures = sum(s.get('judge_failed_attempts', len(s.get('judge_failures', []))) + len(s['judge'].get('prior_errors', [])) for s in samples)
+    failures = sum(failed_judge_attempts(s) + len(s['judge'].get('prior_errors', [])) for s in samples)
     successes = len(samples)
     out.update({'judge/successes': successes, 'judge/failures': failures,
                 'judge/success_rate': successes / (successes + failures),

@@ -181,3 +181,11 @@ def test_fatal_judge_error_preserves_peer_success_and_does_not_retry():
         score_samples(samples, FatalJudge(), 2, lambda: saved.append(sum('judge' in s for s in samples)), retry_delay=0)
     assert calls.count('bad') == 1 and samples[0]['reward'] == .5
     assert 'reward' not in samples[1] and saved[-1] == 1
+
+
+def test_legacy_judge_retry_count_is_preserved():
+    from grpo.online import failed_judge_attempts
+    sample = {'judge_failures': ["Judge failed after bounded retries: KeyError: 'instruction' | KeyError: 'instruction' | KeyError: 'instruction'"]}
+    assert failed_judge_attempts(sample) == 3
+    sample['judge_failed_attempts'] = 5
+    assert failed_judge_attempts(sample) == 5

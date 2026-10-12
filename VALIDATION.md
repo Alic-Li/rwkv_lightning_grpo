@@ -1,3 +1,44 @@
+# Judge Schema 修复、性能优化与恢复验证（2026-10-12）
+
+本节为最新结果。
+
+用户的运行已提交 Step 11，Step 12 保存了 32 条轨迹及 31 个成功评分。缺失样本 `(001002-001, 7)` 在 temperature=0 下三次返回缺少 instruction 的 JSON；原请求仅约束 JSON 对象，重复请求无法修复确定性缺字段输出。
+
+修复：远端采用 strict JSON Schema，必需 semantic/instruction/grounding/task/reason；reason 最多 160 字符。非法响应的重试添加结构修正反馈；评分轮次只重试尚未成功的样本，有界退避，永久 HTTP/context 错误直接退出。沿用原并发请求池，DDP 主线程每秒交换评分状态，无额外 Worker 服务。双进程 Gloo 测试将 collective timeout 设为 3 秒，远端模拟等待 4 秒并自动重试一次，总等待超过 8 秒，通信仍正常完成。
+
+实际缺失样本的 Schema 请求成功：四维分数 4/3/4/4，57 个输出 Token，约 1.49 秒。之前 Run 的评分输出中位数 104 Token、均值 108.45，理由中位数 321 字符；恢复后新批次输出均值约 60 Token。Schema 不改变原四维评分含义和 Reward 计算，已经成功的旧评分不重做。
+
+## 同批 7.2B 前后向性能对照
+
+仅作前后向诊断，没有调用 Optimizer 或修改生产 checkpoint；同一份 Step 11 State、相同 Step 12 数据/Reward/Advantage、同一个 Backbone。
+
+| 执行路径 | 前后向秒 | Teacher Forcing 位置 | 峰值 allocated bytes | Loss | Grad Norm |
+|---|---:|---:|---:|---:|---:|
+| 原分批、全位置 LogSoftmax | 18.776 | 64816 | 42411128320 | 0.358528 | 0.071274 |
+| 长度排序、Completion LogSoftmax | 11.100 | 52240 | 42083972608 | 0.358512 | 0.071087 |
+
+这是一轮诊断对照，不是多次重复基准；耗时约下降 41%，处理位置减少约 19.4%。排序改变 BF16 批形状/累加次序，两个实际梯度的相对 L2 差为 0.048987，不宣称组合优化逐位等价。独立 CUDA 测试确认在相同分批下，Completion-only LogSoftmax 的有效 LogProb 完全一致、完整 Initial State 梯度与原路径在 rtol=1e-5/atol=1e-6 内一致；Prompt-only chunk 的梯度链不断开，冻结 Backbone 无梯度。长度排序仍共用原全局有效 Token 分母，可用 length_bucketing=false 保留原分批顺序。
+
+## 实际恢复至 Step 14
+
+```bash
+uv run python -m grpo.train --config configs/online.full.json --resume --stop-after-steps 14
+```
+
+| Step | Judge 秒 | Training 秒 | 总 Step 秒 | Requested / Cached Scores |
+|---|---:|---:|---:|---|
+| 12 | 0.955 | 12.943 | 14.033 | 1 / 31 |
+| 13 | 29.209 | 10.954 | 44.845 | 32 / 0 |
+| 14 | 34.924 | 17.152 | 67.736 | 32 / 0 |
+
+不同 Step 的 Prompt/Completion 长度不同，这个表不能作为相同负载的整体加速比。Judge 在真实新批次仍是主要耗时，需要远端推理服务改善 Prefill/并发性能；本次没有改动远端配置。
+
+逐条核对 Step 12：原 Completion 和 Old LogProb 全部保留，31 个既有 Judge 结果完全相同，仅补缺失评分。该批次使用原 Step 11 State 指纹。最终 Global Step=Policy Version=14、cursor=56、AdamW step=14，pending 已清理，未重复更新任何已提交 Step。备份位于 latest.before-judge-fix.pt / pending.before-judge-fix.json。
+
+同一 SwanLab Run `948f384a5ded46bfa209db78f41ec4ad` 在线上传完成，本次 236 files / 1.8 MB。最终 `uv run pytest -q`：**54 passed，1 skipped**；跳过项为 NCCL 双 GPU 实机验证。新增覆盖 Schema 缺字段修复、仅重试失败项、永久错误保留同批成功项、历史失败次数、DDP 长请求心跳、Padding 下降和 Completion-only LogSoftmax 完整 BPTT。
+
+---
+
 # 7.2B 对齐拦截修复与真实恢复验证（2026-10-12）
 
 本节为最新结果；后面的首次 Online 验证及历史离线记录保留当时状态。

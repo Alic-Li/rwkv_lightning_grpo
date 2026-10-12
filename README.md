@@ -26,6 +26,8 @@ uv run python -m grpo.judge --config configs/online.full.json
 | `microbatch` | 每个 Rank 单次真正的 batched teacher forcing 大小 |
 | `epochs` / `max_steps` | 数据遍历次数 / 总 Global Step 上限；max_steps=0 表示无额外上限 |
 | `judge_concurrency` | 并发评分数，1～16 |
+| `judge_retry_rounds` / `judge_retry_delay` | 默认 3 个评分轮次 / 2 秒起始退避，只重试缺失项 |
+| `length_bucketing` | 默认 true，每个 Rank 内按序列总长度分 Microbatch，减少 Padding |
 | `checkpoint_interval` | 历史 checkpoint 保存间隔；latest.pt 每轮必须保存 |
 | `chunk_size` | BF16 前向/完整 BPTT chunk，必须与 sampling.prefill_chunk 一致 |
 | `activation_checkpointing` | 默认开启 non-reentrant activation recomputation |
@@ -43,9 +45,11 @@ P/G 定义一次 State 更新，microbatch 仅决定内部累积轮数。无需�
 
 复用现有 CUDA State Passing Autograd、BF16 Forward/Backward 和完整 BPTT，WKV/shift chunk 边界不 detach。Rollout 复用 GPU Batched Prefill 和 Continuous Batched Decode：相同 Prompt 共享 prefill、每条轨迹状态和采样 RNG 独立；保存逐 Token Old LogProb 和有效 Mask。temperature=1、top_p=1；EOS 和停止文本 Token 保持有效。
 
-Judge 使用现有严格四维评分、有限重试和上下文校验。Reward 为四维总分/16，每个完整 Prompt Group 计算 population std 和 `(reward-mean)/(std+eps)`。失败不赋零分，不丢弃失败轨迹进行部分更新。成功请求即时持久化，下次只重试缺失评分。
+Judge 使用严格 JSON Schema，要求四个 0～4 的有限数值及 reason，拒绝缺失/额外字段；reason 最多 160 字符，减少输出开销。远端须支持 OpenAI 兼容的 json_schema response_format，本项目 Qwen/llama-server 已实测支持。保留四维评分、有限重试和上下文校验。Reward 为四维总分/16，每个完整 Prompt Group 计算 population std 和 `(reward-mean)/(std+eps)`。失败不赋零分，不丢弃失败轨迹进行部分更新。成功请求即时持久化，只重试缺失评分。单请求重试中，非法输出会添加结构修正反馈，避免 temperature=0 时重复同一个错误响应；截断仍扩大输出预算。默认最多 3 个评分轮次，各轮间有限退避；持续失败最终停止并保留 pending，绝不赋零分或训练不完整组。永久 HTTP/context 配置错误立即拒绝重试。DDP 在等待期间每秒交换状态心跳，避免一批远程请求耗时超过 NCCL collective 超时。
 
 Teacher forcing 将 `(prompt+completion)[:-1]` 对齐 `[1:]`，仅 Completion Token 计入 Loss。每轮检查全部有效 Token 的 old/new 对齐。平均 Ratio 偏差超过 0.02 或 Clip Fraction 超过 0.01 时拒绝提交更新；非有限数值、State/Step/Policy Version 不匹配仍直接报错。单 Token Decode 和分块 Teacher Forcing 的 BF16 GEMM/递推舍入路径不同，少量 Token 的较大误差不能单独判定策略过期。`alignment_tolerance=0.30` 用于最大误差告警，记录 `alignment/max_error_exceeded`、最大/平均绝对误差和 RMS，并保留所有采样时的 Old LogProb，不用 Teacher Forcing 分数替换。
+
+训练默认在各 Rank 内按总长度排序后组成 Microbatch，减少 Padding；Group 的 Rank 所属不变，每条真实轨迹仍只参与一次更新。开启 Activation Checkpointing 时，仅有效 Completion 位置执行 FP32 vocabulary LogSoftmax，Prompt/Padding 位置仍完整执行 Backbone 并保留 WKV/shift 图，完整 BPTT 不变。长度排序保留全局 Token 分母，但 BF16 批形状/累加顺序会造成浮点差异；如需原分批顺序可设置 `length_bucketing=false`，可在恢复时调整此执行选项。新增 `training/teacher_forcing_tokens` 和 `training/padding_fraction` 记录实际计算量。
 
 DDP 按完整 Prompt Group 分配各 Rank Rollout；Rank 0 汇总并评分，再广播完整训练批。训练沿同一 Group 分配，不重复使用真实样本。所有 Rank 执行相同累积轮数，空槽用零 Mask dummy；每个 loss 乘 `world_size / 全局有效 Completion Token 数`，最后一槽同步并统一裁剪梯度。每轮检查各 Rank State 指纹。加载、前向、评分、保存及日志的 Python 错误通过集体错误传播通知所有 Rank；CUDA/通信致命故障由 torchrun 和 collective 超时终止，恢复时回到最后提交点。
 
