@@ -190,3 +190,23 @@ def test_checkpoint_microbatch_preserves_full_state_gradient(policy):
     assert torch.isfinite(grad).all() and all(g.norm() > 0 for g in grad)
     assert all(p.grad is None for p in policy.backbone.parameters())
     assert [p for p in model.parameters() if p.requires_grad] == [policy.initial_state]
+
+
+def test_completion_only_logsoftmax_keeps_full_prompt_bptt(policy):
+    from grpo.training import TrainingPolicy
+    samples = [dict(prompt_ids=[1, 2, 3] * n, completion_ids=[4, 5, 0],
+                    old_logprobs=[0.] * 3, mask=[1] * 3, advantage=(-1.) ** i)
+               for i, n in enumerate([12, 2])]
+    ids, targets, old, mask, adv = collate(samples, 'cuda')
+    results = []
+    model = TrainingPolicy(policy, True)
+    for selected in [None, mask]:
+        policy.zero_grad(set_to_none=True)
+        new = model(ids, targets, 7, completion_mask=selected)
+        loss = -(new * mask * adv).sum() / mask.sum()
+        loss.backward()
+        results.append((new.detach()[mask.bool()], policy.initial_state.grad.detach().clone()))
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
+    torch.testing.assert_close(results[0][1], results[1][1], rtol=1e-5, atol=1e-6)
+    assert all(s.norm() > 0 for s in results[1][1])
+    assert all(p.grad is None for p in policy.backbone.parameters())

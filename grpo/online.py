@@ -1,6 +1,6 @@
 """Online step primitives. No model loading, file-stage dependency or worker service."""
-from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack, nullcontext
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from time import monotonic
 import math
 
@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from .data import advantages, collate, ppo_sum
-from .judge import DIMS
+from .judge import DIMS, JudgeRequestError
 
 
 def distributed():
@@ -36,30 +36,70 @@ def root_call(fn, rank):
     return rank_call(lambda: fn() if rank == 0 else None)[0]
 
 
-def score_samples(samples, judge, concurrency, save):
-    """Persist each success, including successes finishing after a peer failure."""
-    missing = [s for s in samples if 'judge' not in s]
-    errors = []
+def score_samples(samples, judge, concurrency, save, *, rank=0, max_rounds=3,
+                  retry_delay=2., on_retry=None):
+    """Retry only missing scores; root persists successes, peers receive heartbeats.
+
+    The existing request pool does all remote I/O. Main-thread collectives run
+    at least once per second so DDP peers never wait through an entire Judge
+    batch/retry cycle in a single collective with a finite NCCL timeout.
+    """
+    if max_rounds < 1 or retry_delay < 0:
+        raise ValueError('Judge retry rounds/delay must be positive/nonnegative')
     def score(s):
         start = monotonic()
         result = judge.score(s['prompt'], s['completion'], s['reference'])
         return result, monotonic() - start
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(score, s): s for s in missing}
-        for future in as_completed(futures):
-            s = futures[future]
-            try:
-                result, latency = future.result()
-                if not math.isfinite(result['reward']):
-                    raise ValueError('Nonfinite reward')
-                s['judge'], s['judge_seconds'] = result, latency
-                s['reward'] = result['reward']
-            except Exception as exc:
-                s.setdefault('judge_failures', []).append(str(exc))
-                errors.append(str(exc))
-            save()
-    if errors:
-        raise RuntimeError('Judge failures (no reward fabricated): ' + errors[0])
+
+    for attempt in range(max_rounds):
+        missing = root_call(lambda: [i for i, s in enumerate(samples) if 'judge' not in s], rank)
+        if not missing:
+            break
+        errors, fatal = [], []
+        with ExitStack() as stack:
+            pending = {}
+            if rank == 0:
+                pool = stack.enter_context(ThreadPoolExecutor(max_workers=concurrency))
+                pending = {pool.submit(score, samples[i]): i for i in missing}
+            def poll():
+                done, _ = wait(pending, timeout=1., return_when=FIRST_COMPLETED)
+                for future in done:
+                    s = samples[pending.pop(future)]
+                    if future.cancelled():
+                        continue
+                    try:
+                        result, latency = future.result()
+                        if not math.isfinite(result['reward']):
+                            raise ValueError('Nonfinite reward')
+                        s['judge'], s['judge_seconds'] = result, latency
+                        s['reward'] = result['reward']
+                    except Exception as exc:
+                        s.setdefault('judge_failures', []).append(str(exc))
+                        s['judge_failed_attempts'] = s.get('judge_failed_attempts', 0) + len(getattr(exc, 'errors', [str(exc)]))
+                        s.setdefault('judge_failed_request_seconds', []).extend(getattr(exc, 'request_seconds', []))
+                        errors.append(str(exc))
+                        if isinstance(exc, JudgeRequestError):
+                            fatal.append(str(exc))
+                            for other in pending:
+                                other.cancel()
+                    save()
+                return {'done': not pending, 'errors': errors, 'fatal': fatal}
+            while True:
+                status = root_call(poll, rank)
+                if status['done']:
+                    break
+        if status['fatal']:
+            raise JudgeRequestError(status['fatal'][0])
+        remaining = root_call(lambda: sum('judge' not in s for s in samples), rank)
+        if remaining and attempt + 1 == max_rounds:
+            raise RuntimeError(f"Judge failures (no reward fabricated): {remaining} scores missing after {max_rounds} rounds: " + status['errors'][0])
+        if remaining:
+            if rank == 0 and on_retry:
+                on_retry(attempt + 1, remaining)
+            # Backoff is small/bounded; the next poll resumes DDP heartbeats.
+            import time
+            time.sleep(min(retry_delay * 2**attempt, 10.))
+    return root_call(lambda: samples, rank)
 
 
 def group_advantages(samples, group_size, eps):
@@ -80,17 +120,20 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
     device = policy.initial_state.device
     micro, group = c['microbatch'], c['group_size']
     local = [s for i, s in enumerate(samples) if (i // group) % world == rank]
+    if c.get('length_bucketing', True):
+        local.sort(key=lambda s: len(s['prompt_ids']) + len(s['completion_ids']))
     tokens = sum(sum(s['mask']) for s in samples)
     if tokens <= 0:
         raise ValueError('No valid completion tokens')
     rounds = max(1, math.ceil(math.ceil(len(samples) / group / world) * group / micro))
     optimizer.zero_grad(set_to_none=True)
     before = policy.initial_state.detach().clone()
-    stats = torch.zeros(6, device=device, dtype=torch.float64)
+    stats = torch.zeros(8, device=device, dtype=torch.float64)
     max_error = torch.zeros((), device=device)
     skip = all(s['advantage'] == 0 for s in samples)
     for slot in range(rounds):
         batch = local[slot * micro:(slot + 1) * micro]
+        real_positions = sum(len(s['prompt_ids']) + len(s['completion_ids']) - 1 for s in batch)
         if not batch:
             batch = [{**samples[0], 'mask': [0] * len(samples[0]['mask'])}]
         ids, targets, old, mask, adv = collate(batch, device)
@@ -98,7 +141,7 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
             computed = []
             def forward():
                 with torch.set_grad_enabled(not skip):
-                    new = model(ids, targets, c.get('chunk_size', 128))
+                    new = model(ids, targets, c.get('chunk_size', 128), completion_mask=mask)
                     loss, ratio, clipped = ppo_sum(new, old, adv, mask, c.get('clip_epsilon', .2))
                     delta = torch.where(mask.bool(), new - old, torch.zeros_like(new))
                     kl = ((delta.exp() - 1 - delta) * mask).sum()
@@ -111,7 +154,9 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
                 (loss * world / tokens).backward()
             stats += torch.stack([loss.detach(), ratio.detach(), clipped.detach(), kl.detach(),
                                   (delta.detach().abs() * mask).sum(),
-                                  (delta.detach().square() * mask).sum()]).double()
+                                  (delta.detach().square() * mask).sum(),
+                                  torch.tensor(ids.numel(), device=device),
+                                  torch.tensor(real_positions, device=device)]).double()
             max_error = torch.maximum(max_error, delta.detach().abs().max())
     if distributed():
         dist.all_reduce(stats)
@@ -146,6 +191,8 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
         'training/clip_fraction': float(stats[2] / tokens), 'training/approx_kl': float(stats[3] / tokens),
         'training/grad_norm': norm, 'training/state_norm': float(policy.initial_state.detach().norm()),
         'training/lr': optimizer.param_groups[0]['lr'], 'training/valid_tokens': tokens,
+        'training/teacher_forcing_tokens': int(stats[6]),
+        'training/padding_fraction': float(1 - stats[7] / stats[6]),
         'training/skipped_update': int(skip), 'policy/state_update_norm': float((policy.initial_state.detach() - before).norm()),
         'alignment/max_abs_logprob_error': float(max_error),
         'alignment/max_error_exceeded': int(max_error_exceeded),
@@ -164,10 +211,10 @@ def sample_metrics(samples):
     distribution('advantage', [s['advantage'] for s in samples])
     distribution('rollout/completion_length', [len(s['completion_ids']) for s in samples])
     distribution('judge/latency', [s['judge_seconds'] for s in samples])
-    distribution('judge/request_latency', [latency for s in samples for latency in s['judge'].get('request_seconds', [s['judge_seconds']])])
+    distribution('judge/request_latency', [latency for s in samples for latency in s['judge'].get('request_seconds', [s['judge_seconds']]) + s.get('judge_failed_request_seconds', [])])
     for dim in DIMS:
         distribution('judge/' + dim, [s['judge']['scores'][dim] for s in samples])
-    failures = sum(len(s.get('judge_failures', [])) + len(s['judge'].get('prior_errors', [])) for s in samples)
+    failures = sum(s.get('judge_failed_attempts', len(s.get('judge_failures', []))) + len(s['judge'].get('prior_errors', [])) for s in samples)
     successes = len(samples)
     out.update({'judge/successes': successes, 'judge/failures': failures,
                 'judge/success_rate': successes / (successes + failures),

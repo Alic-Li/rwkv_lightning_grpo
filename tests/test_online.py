@@ -17,7 +17,7 @@ class TinyPolicy(nn.Module):
         self.backbone = nn.Linear(3, 3, bias=False)
         self.backbone.requires_grad_(False)
 
-    def forward(self, ids, targets, chunk_size=128):
+    def forward(self, ids, targets, chunk_size=128, completion_mask=None):
         logits = self.initial_state * (ids.float()[..., None] + 1)
         return logits.log_softmax(-1).gather(-1, targets[..., None]).squeeze(-1)
 
@@ -68,7 +68,7 @@ class FakeLogger:
 def config(tmp_path, **kw):
     c = dict(output=str(tmp_path), prompts_per_step=2, group_size=2, microbatch=1,
              epochs=1, learning_rate=.01, progress=False, sampling={'max_new_tokens': 2},
-             activation_checkpointing=False, judge={}, shuffle=False)
+             activation_checkpointing=False, judge={}, shuffle=False, judge_retry_rounds=1)
     c.update(kw)
     train.validate(c)
     return c
@@ -287,3 +287,25 @@ def test_resume_cli_keeps_original_training_config(tmp_path, monkeypatch):
     c = config_cli('online', resume_options=True)
     assert c == {**original, 'resume': True, 'stop_after_steps': 3}
     assert read_json(path) == original
+
+
+def test_length_bucketing_reduces_padding_with_same_update():
+    from grpo.online import train_step
+    samples = []
+    a, b = TinyPolicy(), TinyPolicy()
+    for i in range(24):
+        p = [0] * (40 if (i // 2) % 2 else 1)
+        c = [1, 1] if i % 2 else [2, 2]
+        seq = p + c
+        with torch.no_grad():
+            old = a(torch.tensor([seq[:-1]]), torch.tensor([seq[1:]]))[0, len(p) - 1:].tolist()
+        samples.append(dict(prompt_ids=p, completion_ids=c, old_logprobs=old,
+                            mask=[1, 1], advantage=(-1.) ** i))
+    metrics = []
+    for policy, bucket in [(a, False), (b, True)]:
+        opt = torch.optim.AdamW([policy.initial_state], lr=.001)
+        metrics.append(train_step(policy, policy, opt, samples, dict(microbatch=8, group_size=2, length_bucketing=bucket)))
+    assert metrics[1]['training/teacher_forcing_tokens'] < metrics[0]['training/teacher_forcing_tokens']
+    assert metrics[1]['training/padding_fraction'] < metrics[0]['training/padding_fraction']
+    assert metrics[0]['training/valid_tokens'] == metrics[1]['training/valid_tokens'] == 48
+    torch.testing.assert_close(a.initial_state, b.initial_state)

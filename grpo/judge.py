@@ -16,9 +16,28 @@ semantic: 0 irrelevant/incoherent, 1 mostly wrong, 2 partially useful, 3 good, 4
 instruction: 0 violates core instruction, 1 major violations, 2 partial, 3 minor issues, 4 follows all.
 grounding: 0 fabricated, 1 mostly unsupported, 2 mixed, 3 mostly supported, 4 fully grounded.
 task: 0 no progress, 1 little progress, 2 partial, 3 sound next action, 4 fully correct next turn.
-Return only JSON with keys semantic, instruction, grounding, task, reason (brief string).
+Return only JSON with keys semantic, instruction, grounding, task, reason (at most 20 words).
 """
 DIMS = ("semantic", "instruction", "grounding", "task")
+
+
+SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **{k: {"type": "number", "minimum": 0, "maximum": 4} for k in DIMS},
+        "reason": {"type": "string", "maxLength": 160},
+    },
+    "required": [*DIMS, "reason"],
+    "additionalProperties": False,
+}
+
+
+class JudgeRetryError(RuntimeError):
+    """Transient request/output failures after one bounded request cycle."""
+    def __init__(self, errors, request_seconds):
+        super().__init__("Judge failed after bounded retries: " + " | ".join(errors))
+        self.errors = errors
+        self.request_seconds = request_seconds
 
 
 class JudgeRequestError(RuntimeError):
@@ -71,28 +90,24 @@ class Judge:
         request_seconds = []
         token_budget = self.config.get("max_tokens", 256)
         max_retry_tokens = self.config.get("max_retry_tokens", token_budget * 4)
+        messages = [
+            {"role": "system", "content": RUBRIC},
+            {"role": "user", "content": json.dumps({
+                "prompt": prompt, "candidate": completion,
+                "reference_next_turn": reference,
+            }, ensure_ascii=False)},
+        ]
         for attempt in range(self.config.get("retries", 2) + 1):
             attempt_started = time.monotonic()
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    messages=[
-                        {"role": "system", "content": RUBRIC},
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "prompt": prompt,
-                                    "candidate": completion,
-                                    "reference_next_turn": reference,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        },
-                    ],
+                    messages=messages,
                     temperature=0,
                     max_tokens=token_budget,
-                    response_format={"type": "json_object"},
+                    response_format={"type": "json_schema", "json_schema": {
+                        "name": "grpo_judgment", "strict": True, "schema": SCORE_SCHEMA,
+                    }},
                     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 choice = response.choices[0]
@@ -103,6 +118,10 @@ class Judge:
                 if choice.finish_reason != "stop":
                     raise ValueError(f"Incomplete judgment: {choice.finish_reason}")
                 obj = json.loads(choice.message.content)
+                expected = {*DIMS, "reason"}
+                if not isinstance(obj, dict) or set(obj) != expected:
+                    keys = set(obj) if isinstance(obj, dict) else set()
+                    raise ValueError(f"Invalid judgment fields: missing={sorted(expected - keys)}, extra={sorted(keys - expected)}")
                 for k in DIMS:
                     v = obj[k]
                     if (
@@ -111,8 +130,8 @@ class Judge:
                         or not 0 <= v <= 4
                     ):
                         raise ValueError(f"Invalid score: {k}={v}")
-                if not isinstance(obj.get("reason"), str):
-                    raise ValueError("Missing judgment rationale")
+                if not isinstance(obj.get("reason"), str) or len(obj["reason"]) > 160:
+                    raise ValueError("Missing/overlong judgment rationale (maximum 160 characters)")
                 reward = sum(float(obj[k]) for k in DIMS) / 16
                 request_seconds.append(time.monotonic() - attempt_started)
                 return {
@@ -152,9 +171,14 @@ class Judge:
             except Exception as exc:
                 request_seconds.append(time.monotonic() - attempt_started)
                 errors.append(f"{type(exc).__name__}: {exc}")
+                if isinstance(exc, (ValueError, KeyError, TypeError)):
+                    # Retrying identical temperature=0 input repeats malformed output.
+                    # Keep the evidence/rubric intact and add only schema feedback.
+                    feedback = f"Previous output was invalid: {exc}. Return all five required fields semantic, instruction, grounding, task, reason; no extra fields."
+                    messages = messages[:2] + [{"role": "user", "content": feedback}]
                 if attempt < self.config.get("retries", 2):
                     time.sleep(min(2**attempt, 4))
-        raise RuntimeError("Judge failed after bounded retries: " + " | ".join(errors))
+        raise JudgeRetryError(errors, request_seconds)
 
 
 if __name__ == "__main__":

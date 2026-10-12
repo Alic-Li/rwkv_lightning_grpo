@@ -84,7 +84,7 @@ def load_policy(config, device):
             dtype=torch.float32,
         )
         version = state_hash(initial_state)
-        if int(os.environ.get("RANK", "0")) == 0:
+        if int(os.environ.get("RANK", "0")) == 0 and not config.get("resume"):
             print("Initial WKV State: FP32 zeros (no checkpoint)", flush=True)
     else:
         ckpt = torch.load(state_path, map_location="cpu", weights_only=True)

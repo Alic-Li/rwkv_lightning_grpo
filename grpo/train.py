@@ -94,7 +94,7 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
     root_call(lambda: (root / 'steps').mkdir(parents=True, exist_ok=True), rank)
     checkpoint = root / 'latest.pt'
     # Runtime stop knobs and secrets don't change the policy/data contract.
-    spec = {k: v for k, v in c.items() if k not in {'resume', 'stop_after_steps', 'swanlab_mode'}}
+    spec = {k: v for k, v in c.items() if k not in {'resume', 'stop_after_steps', 'swanlab_mode', 'judge_retry_rounds', 'judge_retry_delay', 'length_bucketing'}}
     spec['judge'] = {k: v for k, v in c['judge'].items() if k != 'api_key'}
     train_id = digest([spec, snapshot, selected, world])
     optimizer = torch.optim.AdamW([policy.initial_state], lr=c.get('learning_rate', 1e-4), weight_decay=0)
@@ -110,6 +110,8 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             policy.initial_state.copy_(ck['initial_state'].to(device))
         optimizer.load_state_dict(ck['optimizer'])
         restore_rng(ck['rng'][rank])
+        if rank == 0:
+            print(f"Resumed Initial WKV State: step={ck['global_step']}, policy_version={ck['policy_version']}, cursor={ck['cursor']}", flush=True)
     else:
         ck = root_call(lambda: {'global_step': 0, 'epoch': 0, 'cursor': 0, 'policy_version': 0, 'run_id': uuid.uuid4().hex}, rank)
     training = TrainingPolicy(policy, c.get('activation_checkpointing', True))
@@ -195,10 +197,13 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             rollout_phase_seconds = monotonic() - rollout_started
             requested_scores = sum('judge' not in s for s in samples)
             judge_started = monotonic()
-            def scoring():
-                score_samples(samples, judge, c['judge_concurrency'], lambda: atomic_json(pending_path, pending))
-                return samples
-            samples = root_call(scoring, rank)
+            samples = score_samples(
+                samples, judge, c['judge_concurrency'], lambda: atomic_json(pending_path, pending),
+                rank=rank, max_rounds=c.get('judge_retry_rounds', 3),
+                retry_delay=c.get('judge_retry_delay', 2.),
+                on_retry=lambda attempt, remaining: tqdm.write(
+                    f"Step {step}: Judge retry round {attempt + 1}, {remaining} missing scores; successes preserved"),
+            )
             judge_seconds = monotonic() - judge_started
             zero = group_advantages(samples, c['group_size'], c.get('advantage_eps', 1e-6))
             train_started = monotonic()

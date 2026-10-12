@@ -11,12 +11,21 @@ class TrainingPolicy(nn.Module):
         self.policy = policy
         self.activation_checkpointing = activation_checkpointing
 
-    def _chunk(self, ids, targets, states, shifts):
+    def _chunk(self, ids, targets, states, shifts, completion_mask=None):
         logits, states, shifts = self.policy.backbone(ids, states, shifts)
+        if completion_mask is not None:
+            active = completion_mask.bool()
+            # Prompt/padding logits never contribute to the objective. Avoid
+            # their FP32 vocabulary log-softmax while recurrent states/shifts
+            # stay attached for full BPTT through every prompt token.
+            selected = logits[active].float().log_softmax(-1)
+            logp = selected.gather(-1, targets[active][:, None]).squeeze(-1)
+            output = logits.new_zeros(ids.shape, dtype=torch.float32)
+            return output.masked_scatter(active, logp), states, shifts
         logp = logits.float().log_softmax(-1)
         return logp.gather(-1, targets[..., None]).squeeze(-1), states, shifts
 
-    def forward(self, ids, targets, chunk_size=128):
+    def forward(self, ids, targets, chunk_size=128, completion_mask=None):
         if not self.activation_checkpointing or not torch.is_grad_enabled():
             return self.policy(ids, targets, chunk_size)
         states, shifts = self.policy.start(ids.shape[0]), None
@@ -28,6 +37,7 @@ class TrainingPolicy(nn.Module):
                 targets[:, start : start + chunk_size],
                 states,
                 shifts,
+                None if completion_mask is None else completion_mask[:, start : start + chunk_size],
                 use_reentrant=False,
                 preserve_rng_state=False,  # No dropout or sampling in the backbone.
             )

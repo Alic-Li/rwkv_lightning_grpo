@@ -38,3 +38,8 @@ def test_two_gpu_real_training(tmp_path):
     launch('grpo.train', '--config', cfg, timeout=600)
     ck = torch.load(Path(c['output']) / 'latest.pt', weights_only=True)
     assert ck['global_step'] == 3
+
+
+def test_judge_ddp_waits_and_retries_do_not_timeout(tmp_path):
+    assert 'JUDGE_DDP_HEARTBEAT_PASS' in launch('tests.judge_ddp_worker', tmp_path / 'judge.json')
+    assert read_json(tmp_path / 'judge.json')['success']
