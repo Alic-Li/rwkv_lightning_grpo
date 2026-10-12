@@ -1,3 +1,38 @@
+# 7.2B 对齐拦截修复与真实恢复验证（2026-10-12）
+
+本节为最新结果；后面的首次 Online 验证及历史离线记录保留当时状态。
+
+用户的 `runs/online_7b` 在 Step 2 因最大 LogProb 误差 0.578527 中断。检查确认 checkpoint 已提交 Step=1/Policy Version=1/cursor=4，待处理批次 State 指纹完全匹配。
+
+对 6973 个有效 Token 复算：平均 Ratio=1.000089，Clip Fraction=0.1578%，平均绝对误差=0.017777，RMS=0.030866；绝对误差 99% 分位数为 0.107010。使用原 State、所有原 seed 和现有 batched Rollout 重放，32 条 Completion 的 Token 序列完全相同，全部 6973 个采样 LogProb 误差为 0.0。原始 Old LogProb 正确；故障由 BF16 单 Token Decode 与分块 Teacher Forcing 的个别数值尾部误差触发。
+
+修复：最大误差保留为诊断/告警指标，不再单独终止更新。平均 Ratio 偏差 0.02、Clip Fraction 1% 的整体门限保持不变，非有限数值和 State/Step/Policy Version 错配继续拒绝。没有替换 Old LogProb，没有修改 CUDA kernel、BF16 Forward/Backward 或 PPO Loss。
+
+已备份 `latest.before-alignment-fix.pt` 和 `pending.before-alignment-fix.json`，实际执行：
+
+```bash
+uv run python -m grpo.train --config configs/online.full.json --resume --stop-after-steps 3
+```
+
+| Step | State 更新 Norm | Ratio Mean | Clip Fraction | 最大 LogProb 误差 |
+|---|---:|---:|---:|---:|
+| 2 | 0.191255 | 1.000089 | 0.001578 | 0.578527 |
+| 3 | 0.156069 | 0.999684 | 0.001594 | 0.489635 |
+
+恢复后的 Step 2 逐条核对原待处理数据：Completion、Old LogProb、Judge 结果均保持不变，使用原已提交 Step 1 State；Judge requested_scores=0、cached_scores=32。Step 3 完成新一轮采样/评分/更新。最终 checkpoint Global Step=3、Policy Version=3、cursor=12、AdamW 内部 step=3；三个 Step 共 96 条唯一轨迹，版本分别为 0/1/2，pending 已清理。原 Step 1 未重复更新。
+
+同一 SwanLab Run `948f384a5ded46bfa209db78f41ec4ad` 已确认在线上传完成：本次 163 files / 1.3 MB，见 [在线训练 Run](https://swanlab.cn/@Alic/rwkv-state-grpo/runs/948f384a5ded46bfa209db78f41ec4ad)。此前未验收的云端上传与 7.2B 在线更新，现已完成三步范围的实际验证；NCCL 双 GPU 仍未验证。
+
+最终 `uv run pytest -q`：**47 passed，1 skipped**。新增测试覆盖孤立误差允许更新并保留告警、整体 Ratio 漂移/Clip 比例超限仍拒绝更新，以及无需修改 JSON 的恢复 CLI。
+
+继续原训练：
+
+```bash
+uv run python -m grpo.train --config configs/online.full.json --resume
+```
+
+---
+
 # Online GRPO 验证记录（2026-10-12，Asia/Shanghai）
 
 当前入口为 `python -m grpo.train`，配置见 `configs/online.full.json` 和小模型 `configs/online.smoke.json`。下面旧三阶段记录仅保留为历史参考。

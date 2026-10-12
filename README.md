@@ -5,6 +5,10 @@
 ```bash
 uv sync --locked
 uv run python -m grpo.train --config configs/online.full.json
+# 中断后恢复原 Run（不修改 JSON 配置）
+uv run python -m grpo.train --config configs/online.full.json --resume
+# 恢复验证到总 Global Step=3 后退出
+uv run python -m grpo.train --config configs/online.full.json --resume --stop-after-steps 3
 # 多 GPU：每个 Rank 一张独立 GPU，分别加载一份 Backbone
 uv run torchrun --standalone --nproc_per_node=2 -m grpo.train --config configs/online.full.json
 # 仅检查 Judge 模型 ID 和服务端 per-slot context
@@ -41,7 +45,7 @@ P/G 定义一次 State 更新，microbatch 仅决定内部累积轮数。无需�
 
 Judge 使用现有严格四维评分、有限重试和上下文校验。Reward 为四维总分/16，每个完整 Prompt Group 计算 population std 和 `(reward-mean)/(std+eps)`。失败不赋零分，不丢弃失败轨迹进行部分更新。成功请求即时持久化，下次只重试缺失评分。
 
-Teacher forcing 将 `(prompt+completion)[:-1]` 对齐 `[1:]`，仅 Completion Token 计入 Loss。每轮检查全部有效 Token 的 old/new 对齐；最大误差、平均 Ratio 和 Clip Fraction 超限拒绝提交更新，默认阈值为 0.30 / 0.02 / 0.01。阈值用于 BF16 批尺寸舍入差异，不能用于掩盖策略混用。
+Teacher forcing 将 `(prompt+completion)[:-1]` 对齐 `[1:]`，仅 Completion Token 计入 Loss。每轮检查全部有效 Token 的 old/new 对齐。平均 Ratio 偏差超过 0.02 或 Clip Fraction 超过 0.01 时拒绝提交更新；非有限数值、State/Step/Policy Version 不匹配仍直接报错。单 Token Decode 和分块 Teacher Forcing 的 BF16 GEMM/递推舍入路径不同，少量 Token 的较大误差不能单独判定策略过期。`alignment_tolerance=0.30` 用于最大误差告警，记录 `alignment/max_error_exceeded`、最大/平均绝对误差和 RMS，并保留所有采样时的 Old LogProb，不用 Teacher Forcing 分数替换。
 
 DDP 按完整 Prompt Group 分配各 Rank Rollout；Rank 0 汇总并评分，再广播完整训练批。训练沿同一 Group 分配，不重复使用真实样本。所有 Rank 执行相同累积轮数，空槽用零 Mask dummy；每个 loss 乘 `world_size / 全局有效 Completion Token 数`，最后一槽同步并统一裁剪梯度。每轮检查各 Rank State 指纹。加载、前向、评分、保存及日志的 Python 错误通过集体错误传播通知所有 Rank；CUDA/通信致命故障由 torchrun 和 collective 超时终止，恢复时回到最后提交点。
 
