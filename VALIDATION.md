@@ -1,3 +1,30 @@
+# SFT 初始化与兼容 State 导出验证（2026-10-12）
+
+最新实现支持直接加载用户 `v13b-s688.pth`，并导出相同格式的 `latest-state.pth`。核对 `/home/alic-li/rwkv_lightning_cuda/include/rwkv/runtime/rwkv7_fast_v4_common.hpp` 与 `src/bf16_training/model.cpp`：PTH 存储 `[head,value,key]`，本仓库原生 State 同轴，因此不转置。原文件为 32 个 `blocks.N.att.time_state` 键，每层 BF16 `[64,64,64]`，无元数据。配置新增显式 `state_layout=value-key`，初始化转为 FP32；完整恢复 checkpoint 保持 FP32。
+
+实际使用原 7.2B Backbone、原数据、P=4/G=8、microbatch=16、1024 Token 上限、远程 Qwen 与 SwanLab online，先训练 1 步再恢复到第 3 步：
+
+```bash
+uv run python -m grpo.train --config configs/online.full_state_init.json --stop-after-steps 1
+uv run python -m grpo.train --config configs/online.full_state_init.json --resume --stop-after-steps 3
+```
+
+| Step | 轨迹数 | 有效 Token | State 更新范数 | Step 秒数 |
+|---|---:|---:|---:|---:|
+| 1 | 32 | 1019 | 0.270009 | 33.27 |
+| 2 | 32 | 1084 | 0.182912 | 32.58 |
+| 3 | 32 | 1050 | 0.160640 | 38.58 |
+
+初始 FP32 State 范数为 248.799698，与原 BF16 文件逐值转 FP32 一致；初始策略指纹匹配。保存中间 FP32 快照并逐样本核验，第 2/3 轮的 State 指纹分别等于第 1/2 轮提交的 State。最终 Global Step=Policy Version=AdamW step=3，cursor=12，pending 已清理。96 条轨迹都成功评分；每轮只有一次 Optimizer Step。
+
+逐层核验 `runs/online_7b_init/latest-state.pth`：键集合、BF16 dtype、形状与原 SFT 文件相同，值精确等于最新 FP32 State 的 BF16 转换，轴顺序不变。`latest.pt` 仍包含 FP32 State、Optimizer、Sampler/RNG 等完整恢复信息。每次提交后更新导出；若导出失败，恢复从已提交 FP32 checkpoint 重建导出，不重复更新。
+
+SwanLab 沿用 Run `efaa971ec6a94581b32edc487f8124f2`，每步 17 个核心标量，上传完成。完整逐样本及指标保存在本地 steps，汇总为 `runs/online_7b_init/sft_validation.json`。验证后停在第 3 步，继续训练需加 `--resume`。
+
+`uv run pytest -q`：**68 passed，1 skipped**。覆盖 raw SFT 两种显式轴顺序、导出再加载、缺失/额外层、形状/非有限值拒绝、BF16 溢出检查、三轮历史导出及导出中断恢复；双进程 Gloo 测试通过。NCCL 双 GPU 测试仍因硬件不足跳过。代码提交 `59886b7`。
+
+---
+
 # Step 99 Clip Fraction 超限修复与实际验证（2026-10-12）
 
 本节为最新结果。Step 98 已提交，Step 99 因平均 Ratio=0.998073、Clip Fraction=0.020960 超过原 1% 门限而停止。
