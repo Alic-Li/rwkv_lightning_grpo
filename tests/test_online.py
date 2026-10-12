@@ -102,7 +102,9 @@ def test_three_steps_fresh_policy_complete_trace(tmp_path, monkeypatch):
     assert torch.equal(weights, policy.backbone.weight) and policy.backbone.weight.grad is None
     assert policy.initial_state.dtype == torch.float32
     for step, metric in logger.logs:
-        trace = [json.loads(line) for line in ''.join(metric['trace/samples']).splitlines()]
+        trace = [json.loads(line) for line in (tmp_path / f'steps/{step:08d}.jsonl').read_text().splitlines()]
+        assert set(metric) <= train.SWANLAB_METRICS
+        assert not any(k.startswith(('performance/', 'trace/', 'reward/group/')) for k in metric)
         assert len(trace) == 4 and {s['policy_version'] for s in trace} == {step - 1}
         assert {s['step_id'] for s in trace} == {step}
         assert all('old_logprobs' in s and 'judge' in s and 'advantage' in s for s in trace)
@@ -195,16 +197,19 @@ def test_pending_policy_mismatch(tmp_path, monkeypatch):
         loop({**c, 'resume': True}, TinyPolicy())
 
 
-def test_large_trace_is_not_truncated_by_swanlab_media_limit(tmp_path):
-    (tmp_path / 'steps').mkdir()
-    content = '完整记录' * 1000
-    (tmp_path / 'steps/00000001.jsonl').write_text(content)
+def test_swanlab_core_metrics_do_not_upload_detail_or_read_trace(tmp_path):
     logger = FakeLogger()
-    train.log_step(logger, tmp_path, 1, {'training/loss': 1.}, text_bytes=32)
-    payload = logger.logs[0][1]
-    parts = [value for key, value in payload.items() if key.startswith('trace/samples')]
-    assert all(len(part) <= 100 for part in parts)
-    assert ''.join(chunk for part in parts for chunk in part) == content
+    metrics = {
+        'training/loss': 1., 'reward/mean': .5, 'judge/success_rate': 1.,
+        'performance/step_seconds': 10., 'trace/samples': 'private detail',
+        'reward/group/000168-005': .7, 'judge/semantic/mean': 3.,
+        'advantage/std': 1., 'alignment/max_abs_logprob_error': .3,
+        'rollout/stop/eos': .5,
+    }
+    # No steps directory: logging must not open or upload sample files.
+    train.log_step(logger, tmp_path, 1, metrics)
+    assert logger.logs == [(1, {'training/loss': 1., 'reward/mean': .5, 'judge/success_rate': 1.})]
+    assert read_json(tmp_path / 'logged.json') == {'step': 1}
 
 
 def test_alignment_failure_never_commits_or_updates(tmp_path, monkeypatch):

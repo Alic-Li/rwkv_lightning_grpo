@@ -34,7 +34,7 @@ uv run python -m grpo.judge --config configs/online.full.json
 | `resume` | 使用原输出目录 latest.pt 完整恢复 |
 | `stop_after_steps` | 测试用暂停点，不改变恢复配置契约 |
 | `swanlab_mode` | 默认 online；offline 可本地验证后用 swanlab sync 上传 |
-| `trace_text_bytes` | 每个 SwanLab Text 的保守 UTF-8 分块上限，完整数据不截断 |
+| `trace_text_bytes` | 旧配置兼容字段，现已不上传样本文本 |
 | `distributed_timeout_seconds` | NCCL collective 超时，默认 300 秒 |
 
 P/G 定义一次 State 更新，microbatch 仅决定内部累积轮数。无需另设 gradient_accumulation；它由本轮完整轨迹数自动决定。当前 objective 为 PPO clipped GRPO，KL beta=0，每轮只使用本版本生成的数据一次。全组 Advantage 都为零时消费该批并记录 skipped_update，不调用 Optimizer、不增加 Policy Version。
@@ -70,9 +70,10 @@ latest.pt 保存 FP32 State、Optimizer、Scheduler=None（当前固定 LR）、
 
 更新先写逐样本和指标文件，随后原子替换 latest.pt，最后上传日志并清理 pending。若在 Rollout 中断，整轮重新生成，稳定采样 seed 不变；若评分中断，复用成功评分。若在 backward / optimizer / checkpoint 提交前失败，从上一份 State、Optimizer、RNG 恢复并重新执行这一未提交更新。若提交后日志或清理失败，恢复只补日志，不重做更新。未提交的 steps 文件可能已存在，应以 latest.pt.global_step 判断提交状态。
 
-仅 Rank 0 使用 SwanLab。每个 Global Step 上传 Loss、LR、Grad/State Norm、Ratio、Clip Fraction、Approx KL、有效 Token；Reward/Advantage 分布及逐组 Reward、零方差比例；生成长度/停止原因/吞吐；Judge 四维分数、成功/失败率、请求级重试错误与评分延迟；各阶段/总耗时、端到端 tok/s、各 Rank 最大峰值显存；Step/Epoch/版本/更新幅度。
+仅 Rank 0 使用 SwanLab，每个 Global Step 只上传 17 个核心标量：Loss、LR、Grad/State Norm、Ratio、Clip Fraction、Approx KL、有效 Token、跳过更新标记；Reward Mean/Std、零方差组比例；平均 Completion Length、Judge 成功率；Epoch、Policy Version、State 更新幅度。Global Step 作为曲线横轴。
 
-每轮完整 JSONL 同时作为分块 SwanLab Text 上传，包含 Prompt、Completion、Reward、Advantage、Judge 原始评分/理由/重试记录、Token IDs、Mask、Old LogProb、seed、Policy Version 和 Step ID，可通过 `trace/samples` 追溯。使用 SDK 自带异步上传，无额外 Worker 或队列；本地 JSONL 始终为完整来源。Text 序列化和本地 checkpoint 有同步开销，规模较大时可调整 P/G，上传离线数据用 `swanlab sync <run-directory>`。网络确认与日志游标不是原子事务，提交后崩溃可能重传同一步日志，但不会重做 Optimizer Step。
+SwanLab 不再上传 performance、trace、逐 Prompt Group Reward、Judge 各维度及其他细分曲线。完整 Prompt/Completion、Reward/Advantage、Judge 明细、Old LogProb/Mask/Token、Step/Policy Version 仍保存于本地 `steps/*.jsonl`；完整统计保留在 `steps/*.metrics.json`，便于排查和追溯。恢复沿用原 Run ID 和 checkpoint，无需修改配置；已存在 Run 的历史图表保留，后续只更新核心指标。
+
 
 ## 验证
 
@@ -82,4 +83,4 @@ uv run pytest -q
 uv run python -m grpo.train --config configs/online.smoke.json
 ```
 
-测试覆盖连续三轮最新 State、P×G 完整累积/整批等价、冻结参数、逐 Token 对齐、各阶段故障恢复、零 Advantage、完整 SwanLab 样本记录，以及真实双进程 Gloo 在线循环（包括尾批、Epoch、恢复和单 Rank 更新等价）。本机实际训练记录见 [VALIDATION.md](VALIDATION.md)。NCCL 双 GPU 测试需要两张 GPU，并通过 GRPO_DDP_CONFIG 指定小模型在线配置。
+测试覆盖连续三轮最新 State、P×G 完整累积/整批等价、冻结参数、逐 Token 对齐、各阶段故障恢复、零 Advantage、本地完整样本记录和精简 SwanLab 指标，以及真实双进程 Gloo 在线循环（包括尾批、Epoch、恢复和单 Rank 更新等价）。本机实际训练记录见 [VALIDATION.md](VALIDATION.md)。NCCL 双 GPU 测试需要两张 GPU，并通过 GRPO_DDP_CONFIG 指定小模型在线配置。

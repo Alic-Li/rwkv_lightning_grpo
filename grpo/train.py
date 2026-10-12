@@ -44,32 +44,29 @@ def atomic_jsonl(path, records):
     os.replace(tmp, path)
 
 
-def log_step(logger, root, step, metrics, text_bytes):
-    """Use SDK's native asynchronous upload; chunk ALL records without truncation."""
-    path = root / 'steps' / f'{step:08d}.jsonl'
-    content = path.read_text(encoding='utf-8')
-    # Character limit is conservative for UTF-8 (up to four bytes per character).
-    width = max(1, text_bytes // 4)
-    chunks = [logger.Text(content[i:i + width], caption=f'step={step} part={i // width}')
-              for i in range(0, len(content), width)]
-    payload = dict(metrics)
-    # SwanLab limits a media column to 108 items. Separate columns keep every
-    # part of large P*G traces, rather than letting the SDK silently truncate.
-    for start in range(0, len(chunks), 100):
-        key = 'trace/samples' if start == 0 else f'trace/samples_part_{start // 100:04d}'
-        payload[key] = chunks[start:start + 100]
-    logger.log(payload, step=step)
+SWANLAB_METRICS = {
+    'training/loss', 'training/lr', 'training/grad_norm', 'training/state_norm',
+    'training/ratio_mean', 'training/clip_fraction', 'training/approx_kl',
+    'training/valid_tokens', 'training/skipped_update',
+    'reward/mean', 'reward/std', 'reward/zero_variance_group_fraction',
+    'rollout/completion_length/mean', 'judge/success_rate',
+    'policy/epoch', 'policy/version', 'policy/state_update_norm',
+}
+
+
+def log_step(logger, root, step, metrics):
+    """Upload only the core scalar dashboard; full records stay in local JSONL."""
+    logger.log({key: value for key, value in metrics.items() if key in SWANLAB_METRICS}, step=step)
     atomic_json(root / 'logged.json', {'step': step})
 
 
 def validate(c):
+    # Retain the legacy trace_text_bytes default for checkpoint identity only.
     for key, default in [('prompts_per_step', 4), ('group_size', 8), ('microbatch', 16),
                          ('epochs', 1), ('checkpoint_interval', 1), ('chunk_size', 128), ('trace_text_bytes', 32768)]:
         c.setdefault(key, default)
         if type(c[key]) is not int or c[key] < 1:
             raise ValueError(f'{key} must be a positive integer')
-    if c['trace_text_bytes'] > 8 * 1024**2:
-        raise ValueError('trace_text_bytes must stay below SwanLab single-media limit')
     if c['group_size'] < 2 or c.get('max_steps', 0) < 0:
         raise ValueError('Require group_size >= 2 and max_steps >= 0')
     c.setdefault('judge_concurrency', c['judge'].get('concurrency', 8))
@@ -143,7 +140,7 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             if logged < ck['global_step']:
                 metrics_path = root / 'steps' / f"{ck['global_step']:08d}.metrics.json"
                 saved_metrics = read_json(metrics_path) if metrics_path.exists() else ck['metrics']
-                log_step(logger, root, ck['global_step'], saved_metrics, c['trace_text_bytes'])
+                log_step(logger, root, ck['global_step'], saved_metrics)
     root_call(report, rank)
     total = c['epochs'] * ((len(selected) + c['prompts_per_step'] - 1) // c['prompts_per_step'])
     total = min(total, c.get('max_steps') or total)
