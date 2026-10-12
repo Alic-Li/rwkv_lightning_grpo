@@ -1,0 +1,12 @@
+[project]
+name = "rwkv-state-grpo"
+version = "0.1.0"
+description = "Native PyTorch three-stage RWKV-7 state-only GRPO"
+requires-python = ">=3.12"
+dependencies = ["torch>=2.9", "ninja", "numpy", "openai>=1.0", "swanlab", "tqdm"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

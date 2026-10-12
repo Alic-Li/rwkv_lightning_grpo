@@ -1,0 +1,14 @@
+{
+  "rollouts": "runs/g1k_7b_v0/rollouts.jsonl",
+  "output": "runs/g1k_7b_v0/manifest.json",
+  "judge": {
+    "url": "http://192.168.110.25:8000",
+    "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL",
+    "concurrency": 8,
+    "timeout": 90,
+    "retries": 2,
+    "max_tokens": 256,
+    "min_context_tokens": 16384
+  },
+  "advantage_eps": 1e-06
+}
