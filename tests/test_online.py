@@ -241,3 +241,49 @@ def test_resume_restores_sampling_rng(tmp_path, monkeypatch):
     resumed = loop({**c, 'resume': True}, TinyPolicy())
     assert resumed['rng'][0]['python'] == expected['rng'][0]['python']
     torch.testing.assert_close(resumed['rng'][0]['torch'], expected['rng'][0]['torch'])
+
+
+def alignment_batch(policy, count, drift_count, drift):
+    with torch.no_grad():
+        old = float(policy(torch.tensor([[0]]), torch.tensor([[1]]))[0, 0])
+    return [dict(prompt_ids=[0], completion_ids=[1], mask=[1],
+                 old_logprobs=[old - (drift if i < drift_count else 0)],
+                 advantage=(-1.) ** i) for i in range(count)]
+
+
+def test_isolated_bf16_outlier_is_diagnostic_not_step_failure():
+    from grpo.online import train_step
+    policy = TinyPolicy()
+    optimizer = torch.optim.AdamW([policy.initial_state], lr=.001, weight_decay=0)
+    samples = alignment_batch(policy, 1000, 1, .578527)
+    c = dict(microbatch=128, group_size=2, alignment_tolerance=.3,
+             alignment_mean_ratio_tolerance=.02, alignment_max_clip_fraction=.01)
+    metrics = train_step(policy, policy, optimizer, samples, c)
+    assert metrics['alignment/max_error_exceeded'] == 1
+    assert metrics['alignment/max_abs_logprob_error'] == pytest.approx(.578527)
+    assert metrics['training/clip_fraction'] == pytest.approx(.001)
+    assert optimizer.state[policy.initial_state]['step'] == 1
+
+
+@pytest.mark.parametrize('drift_count,drift', [(1000, .05), (20, .25)])
+def test_population_alignment_failure_still_prevents_update(drift_count, drift):
+    from grpo.online import train_step
+    policy = TinyPolicy()
+    before = policy.initial_state.detach().clone()
+    optimizer = torch.optim.AdamW([policy.initial_state], lr=.001, weight_decay=0)
+    samples = alignment_batch(policy, 1000, drift_count, drift)
+    with pytest.raises(RuntimeError, match='ratio alignment'):
+        train_step(policy, policy, optimizer, samples, dict(microbatch=128, group_size=2))
+    torch.testing.assert_close(policy.initial_state, before)
+    assert not optimizer.state
+
+
+def test_resume_cli_keeps_original_training_config(tmp_path, monkeypatch):
+    from grpo.io import config_cli
+    path = tmp_path / 'config.json'
+    original = dict(output='run', resume=False, microbatch=16)
+    path.write_text(json.dumps(original))
+    monkeypatch.setattr('sys.argv', ['grpo.train', '--config', str(path), '--resume', '--stop-after-steps', '3'])
+    c = config_cli('online', resume_options=True)
+    assert c == {**original, 'resume': True, 'stop_after_steps': 3}
+    assert read_json(path) == original

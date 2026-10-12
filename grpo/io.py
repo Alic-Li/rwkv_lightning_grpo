@@ -109,10 +109,21 @@ def load_policy(config, device):
     return policy, snapshot
 
 
-def config_cli(description):
+def config_cli(description, *, resume_options=False):
     import argparse
 
     p = argparse.ArgumentParser(description=description)
     p.add_argument("--config", required=True)
+    if resume_options:
+        p.add_argument("--resume", action="store_true", help="Resume the committed state and pending step")
+        p.add_argument("--stop-after-steps", type=int, help="Stop once this total global step is committed")
     args = p.parse_args()
-    return read_json(args.config)
+    config = read_json(args.config)
+    if resume_options:
+        if args.resume:
+            config["resume"] = True
+        if args.stop_after_steps is not None:
+            if args.stop_after_steps < 1:
+                p.error("--stop-after-steps must be positive")
+            config["stop_after_steps"] = args.stop_after_steps
+    return config

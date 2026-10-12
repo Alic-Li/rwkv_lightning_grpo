@@ -203,6 +203,10 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             zero = group_advantages(samples, c['group_size'], c.get('advantage_eps', 1e-6))
             train_started = monotonic()
             metrics = train_step(policy, model, optimizer, samples, c, rank, world)
+            if rank == 0 and metrics['alignment/max_error_exceeded']:
+                tqdm.write(f"Step {step}: BF16 alignment tail max={metrics['alignment/max_abs_logprob_error']:.6f} "
+                           f"(diagnostic), ratio={metrics['training/ratio_mean']:.6f}, "
+                           f"clip_fraction={metrics['training/clip_fraction']:.4%}")
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             train_seconds = monotonic() - train_started
@@ -299,4 +303,4 @@ def run(c):
 
 
 if __name__ == '__main__':
-    run(config_cli(__doc__))
+    run(config_cli(__doc__, resume_options=True))
