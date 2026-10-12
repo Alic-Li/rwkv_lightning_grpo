@@ -95,13 +95,20 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
             batch = [{**samples[0], 'mask': [0] * len(samples[0]['mask'])}]
         ids, targets, old, mask, adv = collate(batch, device)
         with model.no_sync() if world > 1 and slot < rounds - 1 else nullcontext():
-            with torch.set_grad_enabled(not skip):
-                new = model(ids, targets, c.get('chunk_size', 128))
-                loss, ratio, clipped = ppo_sum(new, old, adv, mask, c.get('clip_epsilon', .2))
-                delta = torch.where(mask.bool(), new - old, torch.zeros_like(new))
-                kl = ((delta.exp() - 1 - delta) * mask).sum()
-                if not skip:
-                    (loss * world / tokens).backward()
+            computed = []
+            def forward():
+                with torch.set_grad_enabled(not skip):
+                    new = model(ids, targets, c.get('chunk_size', 128))
+                    loss, ratio, clipped = ppo_sum(new, old, adv, mask, c.get('clip_epsilon', .2))
+                    delta = torch.where(mask.bool(), new - old, torch.zeros_like(new))
+                    kl = ((delta.exp() - 1 - delta) * mask).sum()
+                if not torch.isfinite(loss) or not torch.isfinite(delta).all():
+                    raise RuntimeError('Nonfinite forward/loss')
+                computed.append((loss, ratio, clipped, delta, kl))
+            rank_call(forward)
+            loss, ratio, clipped, delta, kl = computed[0]
+            if not skip:
+                (loss * world / tokens).backward()
             stats += torch.stack([loss.detach(), ratio.detach(), clipped.detach(), kl.detach()]).double()
             max_error = torch.maximum(max_error, delta.detach().abs().max())
     if distributed():

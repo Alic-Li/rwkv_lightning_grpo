@@ -1,4 +1,4 @@
-"""Append-only JSONL artifacts shared by the three independent CLI stages."""
+"""Legacy artifact readers retained for inspecting historical offline runs."""
 
 import json
 import math

@@ -3,6 +3,7 @@ import json
 import os
 import random
 import uuid
+from datetime import timedelta
 from contextlib import ExitStack
 from pathlib import Path
 from time import monotonic
@@ -49,8 +50,15 @@ def log_step(logger, root, step, metrics, text_bytes):
     content = path.read_text(encoding='utf-8')
     # Character limit is conservative for UTF-8 (up to four bytes per character).
     width = max(1, text_bytes // 4)
-    logger.log({**metrics, 'trace/samples': [logger.Text(content[i:i + width], caption=f'step={step} part={i // width}')
-                                          for i in range(0, len(content), width)]}, step=step)
+    chunks = [logger.Text(content[i:i + width], caption=f'step={step} part={i // width}')
+              for i in range(0, len(content), width)]
+    payload = dict(metrics)
+    # SwanLab limits a media column to 108 items. Separate columns keep every
+    # part of large P*G traces, rather than letting the SDK silently truncate.
+    for start in range(0, len(chunks), 100):
+        key = 'trace/samples' if start == 0 else f'trace/samples_part_{start // 100:04d}'
+        payload[key] = chunks[start:start + 100]
+    logger.log(payload, step=step)
     atomic_json(root / 'logged.json', {'step': step})
 
 
@@ -60,6 +68,8 @@ def validate(c):
         c.setdefault(key, default)
         if type(c[key]) is not int or c[key] < 1:
             raise ValueError(f'{key} must be a positive integer')
+    if c['trace_text_bytes'] > 8 * 1024**2:
+        raise ValueError('trace_text_bytes must stay below SwanLab single-media limit')
     if c['group_size'] < 2 or c.get('max_steps', 0) < 0:
         raise ValueError('Require group_size >= 2 and max_steps >= 0')
     c.setdefault('judge_concurrency', c['judge'].get('concurrency', 8))
@@ -174,6 +184,11 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             else:
                 samples = pending['samples']
                 rollout_seconds = pending['rollout_seconds']
+            expected = {(p['id'], g) for p in batch for g in range(c['group_size'])}
+            if len(samples) != len(expected) or {(s['prompt_id'], s['sample_index']) for s in samples} != expected:
+                raise ValueError('Incomplete/duplicate step trajectories')
+            if any(any(s[k] != contract[k] for k in ('step_id', 'policy_version', 'state_version', 'train_id')) for s in samples):
+                raise ValueError('Trajectory policy version mismatch')
             judge_started = monotonic()
             def scoring():
                 score_samples(samples, judge, c['judge_concurrency'], lambda: atomic_json(pending_path, pending))
@@ -231,7 +246,7 @@ def run(c):
         raise RuntimeError('One distinct CUDA device per local rank is required')
     torch.cuda.set_device(local)
     if world > 1:
-        dist.init_process_group('nccl')
+        dist.init_process_group('nccl', timeout=timedelta(seconds=c.get('distributed_timeout_seconds', 300)))
     rank = dist.get_rank() if distributed() else 0
     try:
         with ExitStack() as stack:
@@ -243,7 +258,9 @@ def run(c):
             loaded = []
             rank_call(lambda: loaded.append(load_policy(c, torch.device('cuda', local))))
             policy, snapshot = loaded[0]
-            tokenizer = TRIE_TOKENIZER(c['vocab'])
+            tokenizers = []
+            rank_call(lambda: tokenizers.append(TRIE_TOKENIZER(c['vocab'])))
+            tokenizer = tokenizers[0]
             def select():
                 rows = list(prompts(c['data'], tokenizer, c.get('max_prompt_tokens', 8192)))
                 if c.get('shuffle', True):
@@ -252,7 +269,7 @@ def run(c):
             selected = root_call(select, rank)
             if not selected:
                 raise ValueError('No eligible prompts')
-            snapshot.update(data_sha256=file_hash(c['data']), vocab_sha256=file_hash(c['vocab']))
+            snapshot.update(root_call(lambda: dict(data_sha256=file_hash(c['data']), vocab_sha256=file_hash(c['vocab'])), rank))
             if rank == 0:
                 import swanlab
                 logger = swanlab
