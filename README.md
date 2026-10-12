@@ -70,6 +70,8 @@ latest.pt 保存 FP32 State、Optimizer、Scheduler=None（当前固定 LR）、
 
 ```bash
 uv run pytest -q
+# 小模型 + 远程 Judge（修改本地路径/服务地址后运行）
+uv run python -m grpo.train --config configs/online.smoke.json
 ```
 
 测试覆盖连续三轮最新 State、P×G 完整累积/整批等价、冻结参数、逐 Token 对齐、各阶段故障恢复、零 Advantage、完整 SwanLab 样本记录，以及真实双进程 Gloo 在线循环（包括尾批、Epoch、恢复和单 Rank 更新等价）。本机实际训练记录见 [VALIDATION.md](VALIDATION.md)。NCCL 双 GPU 测试需要两张 GPU，并通过 GRPO_DDP_CONFIG 指定小模型在线配置。

@@ -68,9 +68,11 @@ class Judge:
 
     def score(self, prompt, completion, reference):
         errors = []
+        request_seconds = []
         token_budget = self.config.get("max_tokens", 256)
         max_retry_tokens = self.config.get("max_retry_tokens", token_budget * 4)
         for attempt in range(self.config.get("retries", 2) + 1):
+            attempt_started = time.monotonic()
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -112,7 +114,9 @@ class Judge:
                 if not isinstance(obj.get("reason"), str):
                     raise ValueError("Missing judgment rationale")
                 reward = sum(float(obj[k]) for k in DIMS) / 16
+                request_seconds.append(time.monotonic() - attempt_started)
                 return {
+                    "request_seconds": request_seconds,
                     "scores": obj,
                     "reward": reward,
                     "model": response.model,
@@ -122,6 +126,7 @@ class Judge:
                     "max_tokens_budget": token_budget,
                 }
             except APIStatusError as exc:
+                request_seconds.append(time.monotonic() - attempt_started)
                 if 400 <= exc.status_code < 500 and exc.status_code not in (
                     408,
                     409,
@@ -145,6 +150,7 @@ class Judge:
                 if attempt < self.config.get("retries", 2):
                     time.sleep(min(2**attempt, 4))
             except Exception as exc:
+                request_seconds.append(time.monotonic() - attempt_started)
                 errors.append(f"{type(exc).__name__}: {exc}")
                 if attempt < self.config.get("retries", 2):
                     time.sleep(min(2**attempt, 4))

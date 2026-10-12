@@ -139,7 +139,9 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
         if rank == 0 and logger is not None and ck.get('metrics'):
             logged = read_json(root / 'logged.json')['step'] if (root / 'logged.json').exists() else 0
             if logged < ck['global_step']:
-                log_step(logger, root, ck['global_step'], ck['metrics'], c['trace_text_bytes'])
+                metrics_path = root / 'steps' / f"{ck['global_step']:08d}.metrics.json"
+                saved_metrics = read_json(metrics_path) if metrics_path.exists() else ck['metrics']
+                log_step(logger, root, ck['global_step'], saved_metrics, c['trace_text_bytes'])
     root_call(report, rank)
     total = c['epochs'] * ((len(selected) + c['prompts_per_step'] - 1) // c['prompts_per_step'])
     total = min(total, c.get('max_steps') or total)
@@ -164,6 +166,7 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             if pending and pending['contract'] != contract:
                 raise ValueError('Pending rollout belongs to a different policy/data step')
             rollout_started = monotonic()
+            reused_rollout = pending is not None
             if pending is None:
                 def collect():
                     jobs = [(p, g) for i, p in enumerate(batch) if i % world == rank for g in range(c['group_size'])]
@@ -189,6 +192,8 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
                 raise ValueError('Incomplete/duplicate step trajectories')
             if any(any(s[k] != contract[k] for k in ('step_id', 'policy_version', 'state_version', 'train_id')) for s in samples):
                 raise ValueError('Trajectory policy version mismatch')
+            rollout_phase_seconds = monotonic() - rollout_started
+            requested_scores = sum('judge' not in s for s in samples)
             judge_started = monotonic()
             def scoring():
                 score_samples(samples, judge, c['judge_concurrency'], lambda: atomic_json(pending_path, pending))
@@ -215,8 +220,10 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             metrics.update(sample_metrics(samples))
             metrics.update({'reward/zero_variance_group_fraction': zero, 'rollout/generated_tokens': generated_tokens,
                             'rollout/tokens_per_second': generated_tokens / rollout_seconds,
-                            'judge/throughput': len(samples) / judge_seconds,
-                            'performance/rollout_seconds': rollout_seconds, 'performance/judge_seconds': judge_seconds,
+                            'judge/throughput': requested_scores / judge_seconds,
+                            'judge/requested_scores': requested_scores, 'judge/cached_scores': len(samples) - requested_scores,
+                            'rollout/reused': int(reused_rollout), 'rollout/generation_seconds': rollout_seconds,
+                            'performance/rollout_seconds': rollout_phase_seconds, 'performance/judge_seconds': judge_seconds,
                             'performance/training_seconds': max(t['training'] for t in times),
                             'performance/step_seconds': step_seconds, 'performance/tokens_per_second': generated_tokens / step_seconds,
                             'performance/gpu_peak_memory_bytes': max(t['memory'] for t in times),
@@ -226,7 +233,14 @@ def online_loop(c, policy, snapshot, selected, tokenizer, judge, logger=None):
             root_call(lambda: atomic_json(root / 'steps' / f'{step:08d}.metrics.json', metrics), rank)
             # Durable commit precedes logging/cleanup. A crash before this point replays
             # from the PRE-step optimizer/state/RNG; a crash after it never updates twice.
+            checkpoint_started = monotonic()
             commit(metrics)
+            final_times = rank_call(lambda: (monotonic() - started, monotonic() - checkpoint_started))
+            step_seconds = max(t[0] for t in final_times)
+            metrics.update({'performance/step_seconds': step_seconds,
+                            'performance/checkpoint_seconds': max(t[1] for t in final_times),
+                            'performance/tokens_per_second': generated_tokens / step_seconds})
+            root_call(lambda: atomic_json(root / 'steps' / f'{step:08d}.metrics.json', metrics), rank)
             root_call(report, rank)
             root_call(lambda: pending_path.unlink(missing_ok=True), rank)
             progress.update(1)

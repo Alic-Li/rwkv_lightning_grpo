@@ -1,3 +1,45 @@
+# Online GRPO 验证记录（2026-10-12，Asia/Shanghai）
+
+当前入口为 `python -m grpo.train`，配置见 `configs/online.full.json` 和小模型 `configs/online.smoke.json`。下面旧三阶段记录仅保留为历史参考。
+
+## 本次自动化验收
+
+`uv run pytest -q`：**43 passed，1 skipped**。单 GPU 无法执行 NCCL 双 GPU 测试；真实双进程 Gloo 测试通过。
+
+- 连续三个 Online Step，各一次 AdamW 更新；下一轮 Rollout State 与上一轮 checkpoint State 一致。
+- P×G 全部轨迹参与累积；microbatch=1 与整批的 State/AdamW moment 等价。
+- 冻结 Backbone/BF16 参数，FP32 Initial State 梯度和更新非零；保留 CUDA 对照、终态反传、Activation Checkpointing 与完整 BPTT 原测试。
+- 双进程实际在线引擎执行完整组切分、空槽同步、尾批、两个 Epoch 和暂停恢复，更新与单 Rank 等价；真实样本不重复。
+- Rollout/Judge/Optimizer 后/Checkpoint 提交前/日志失败的恢复测试，均与连续训练最终 State 和 AdamW moment 一致。
+- Python/Torch RNG 恢复；配置/State/待处理 Policy Version 校验；对齐失败不调用 Optimizer，不提交新 Step。
+- 逐样本 JSONL 与 SwanLab Text 重组完全一致；超过 SDK 的 108 媒体项上限时分列，避免截断。
+
+## 实际 BF16 模型 + 远程 Judge
+
+硬件：单张 RTX PRO 6000 Blackwell，97,887 MiB；模型 `/mnt/sda1/rwkv_weights/rwkv7-g1d-0.1b-20260129-ctx8192.pth`；复用现有 CUDA kernel。Judge 实际模型 `Qwen3.6-35B-A3B-UD-Q8_K_XL`，8 slots，每 slot context 32768。
+
+本地运行目录 `runs/online-real-validation/train-short`：6 个短真实 Prompt，P=2/G=8/microbatch=2/max_new_tokens=12，LR=1e-4。Completion 全部由模型实际采样，评分全部来自远程 Judge。
+
+| Step | State 更新 Norm | Grad Norm | Ratio Mean | Clip Fraction | 最大 LogProb 误差 | Step 秒（当时阶段计时） |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 0.075940 | 8.076583 | 1.001725 | 0.005291 | 0.202239 | 8.36 |
+| 2 | 0.053773 | 5.807243 | 0.997278 | 0 | 0.140561 | 8.64 |
+| 3 | 0.042894 | 17.352558 | 1.002669 | 0.005848 | 0.192908 | 8.42 |
+
+最终 Global Step=3、Policy Version=3、Epoch=1、Sampler cursor=0。再次以 resume=true 启动该已完成运行，Global Step 保持 3，没有执行新训练或新增轨迹。逐条验证第二、三轮 State 指纹等于前轮保存的 State。48 条完整轨迹及三个 Step 指标写入本地 JSONL/SwanLab；全部 13 个 SwanLab 原生 Text 文件内容逐块与原始 JSONL 比对一致。峰值 allocated 596,244,992 bytes。此后计时代码补充了 checkpoint 耗时，最终 Step Time 覆盖原子提交，上传异步处理时间不计入。
+
+## 对齐保护与恢复的实际限制
+
+另一轮 max_new_tokens=48/LR=1e-3 的实验：首轮完成，第二轮 BF16 对齐误差约 0.47、Clip Fraction 约 4%，超过配置阈值后停止。逐条 teacher forcing 和 microbatch=2/8 的复算均有误差，未通过放宽阈值继续更新。
+
+真实暂停实验在 Step 1 后退出，再从 checkpoint 恢复。恢复后的新 Rollout State 指纹与已提交 checkpoint 一致；下一轮被 BF16 对齐门限拦截（包括一个 max_error=0.300430 的短生成实验）。已验证 latest.pt 保持 Step/Policy Version=1，State 与原 Step 1 快照完全一致，没有重复提交 Step 1。自动化测试中的完整恢复到三轮已经通过；真实中途恢复实验尚未完成余下两轮更新。不能将此描述为长序列或任意配置均已通过。
+
+本机仅验证 SwanLab offline 原生 SDK 日志；环境没有 SWANLAB_API_KEY，未验证云端实时上传。生产配置默认 online，需配置用户的 SwanLab 登录；离线日志可用 SDK 提示的 `swanlab sync` 命令上传。NCCL 双卡和 7.2B 连续在线训练未在本次验收运行。
+
+---
+
+## 历史离线验证记录
+
 # 验证记录（2026-10-11，Asia/Shanghai）
 
 当前接口已改为三个独立阶段，命令和数据格式以 README 为准；下面早期记录中的 Stage 2 是当时的训练阶段。

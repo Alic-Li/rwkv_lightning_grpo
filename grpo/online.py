@@ -114,10 +114,12 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
     if distributed():
         dist.all_reduce(stats)
         dist.all_reduce(max_error, op=dist.ReduceOp.MAX)
-    if not torch.isfinite(stats).all() or float(max_error) > c.get('alignment_tolerance', .3):
-        raise RuntimeError('Nonfinite loss or old/new logprob alignment exceeds BF16 tolerance')
+    if not torch.isfinite(stats).all():
+        raise RuntimeError('Nonfinite loss statistics')
+    if float(max_error) > c.get('alignment_tolerance', .3):
+        raise RuntimeError(f'Old/new logprob alignment exceeds BF16 tolerance: max_error={float(max_error):.6f}')
     if abs(float(stats[1] / tokens) - 1) > c.get('alignment_mean_ratio_tolerance', .02) or float(stats[2] / tokens) > c.get('alignment_max_clip_fraction', .01):
-        raise RuntimeError('Old/new ratio alignment exceeds BF16 tolerance')
+        raise RuntimeError(f'Old/new ratio alignment exceeds BF16 tolerance: ratio={float(stats[1] / tokens):.6f}, clip_fraction={float(stats[2] / tokens):.6f}')
     norm = 0.
     if not skip:
         def check_gradient():
@@ -128,9 +130,11 @@ def train_step(policy, model, optimizer, samples, c, rank=0, world=1):
                 raise RuntimeError('Backbone must stay frozen')
         rank_call(check_gradient)
         norm = float(torch.nn.utils.clip_grad_norm_([policy.initial_state], c.get('max_grad_norm', 1.), error_if_nonfinite=True))
-        optimizer.step()
-    if not torch.isfinite(policy.initial_state).all():
-        raise RuntimeError('Nonfinite updated state')
+        rank_call(lambda: optimizer.step())
+    def check_state():
+        if not torch.isfinite(policy.initial_state).all():
+            raise RuntimeError('Nonfinite updated state')
+    rank_call(check_state)
     return {
         'training/loss': float(stats[0] / tokens), 'training/ratio_mean': float(stats[1] / tokens),
         'training/clip_fraction': float(stats[2] / tokens), 'training/approx_kl': float(stats[3] / tokens),
@@ -151,6 +155,7 @@ def sample_metrics(samples):
     distribution('advantage', [s['advantage'] for s in samples])
     distribution('rollout/completion_length', [len(s['completion_ids']) for s in samples])
     distribution('judge/latency', [s['judge_seconds'] for s in samples])
+    distribution('judge/request_latency', [latency for s in samples for latency in s['judge'].get('request_seconds', [s['judge_seconds']])])
     for dim in DIMS:
         distribution('judge/' + dim, [s['judge']['scores'][dim] for s in samples])
     failures = sum(len(s.get('judge_failures', [])) + len(s['judge'].get('prior_errors', [])) for s in samples)

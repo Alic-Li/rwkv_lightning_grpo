@@ -205,3 +205,39 @@ def test_large_trace_is_not_truncated_by_swanlab_media_limit(tmp_path):
     parts = [value for key, value in payload.items() if key.startswith('trace/samples')]
     assert all(len(part) <= 100 for part in parts)
     assert ''.join(chunk for part in parts for chunk in part) == content
+
+
+def test_alignment_failure_never_commits_or_updates(tmp_path, monkeypatch):
+    def corrupt(*args):
+        samples = fake_rollout(*args)
+        samples[0]['old_logprobs'][0] += 1
+        return samples
+    monkeypatch.setattr(train, 'rollout_batch', corrupt)
+    steps = []
+    monkeypatch.setattr(torch.optim.AdamW, 'step', lambda *args: steps.append(1))
+    with pytest.raises(RuntimeError, match='alignment'):
+        loop(config(tmp_path), TinyPolicy())
+    ck = torch.load(tmp_path / 'latest.pt', weights_only=True)
+    assert ck['global_step'] == ck['policy_version'] == 0
+    assert not steps
+
+
+def test_resume_restores_sampling_rng(tmp_path, monkeypatch):
+    import random
+    def stochastic(*args):
+        random.random()
+        torch.rand(5)
+        return fake_rollout(*args)
+    monkeypatch.setattr(train, 'rollout_batch', stochastic)
+    random.seed(777)
+    torch.manual_seed(777)
+    expected = loop(config(tmp_path / 'continuous'), TinyPolicy())
+    random.seed(777)
+    torch.manual_seed(777)
+    c = config(tmp_path / 'resumed')
+    loop({**c, 'stop_after_steps': 1}, TinyPolicy())
+    random.random()
+    torch.rand(100)
+    resumed = loop({**c, 'resume': True}, TinyPolicy())
+    assert resumed['rng'][0]['python'] == expected['rng'][0]['python']
+    torch.testing.assert_close(resumed['rng'][0]['torch'], expected['rng'][0]['torch'])

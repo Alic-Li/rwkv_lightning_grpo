@@ -1,0 +1,6 @@
+{"segments": [{"text": "User: What is 2+2?\n\nAssistant:", "train": false}, {"text": " 4", "train": true}]}
+{"segments": [{"text": "User: Write a short poem about rain.\n\nAssistant:", "train": false}, {"text": " Rain falls softly on the ground.", "train": true}]}
+{"segments": [{"text": "User: Explain why the sky is blue.\n\nAssistant:", "train": false}, {"text": " Air scatters blue light more strongly.", "train": true}]}
+{"segments": [{"text": "User: Give three tips for studying math.\n\nAssistant:", "train": false}, {"text": " Practice, review mistakes, and ask questions.", "train": true}]}
+{"segments": [{"text": "User: What is 7 times 8?\n\nAssistant:", "train": false}, {"text": " 56", "train": true}]}
+{"segments": [{"text": "User: Write a sentence about a cat.\n\nAssistant:", "train": false}, {"text": " The cat slept on a warm windowsill.", "train": true}]}
